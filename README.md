@@ -1,112 +1,54 @@
-# Model-Based Diffusion for Trajectory Optimization
+# D4ORM - Diffusion-based optimization for multi-robot trajectory planning
 
-<div align="center">
+## Introduction
 
-[[Website]](https://lecar-lab.github.io/mbd/)
-[[PDF]](https://drive.google.com/file/d/1kPjD79Cfr9spWulWNVFMRHqTE-mjbGAp/view?usp=sharing)
-[[Arxiv]](https://arxiv.org/pdf/2407.01573)
+This repository builds upon the [Model-Based Diffusion for Trajectory Optimization (MBD)](https://arxiv.org/pdf/2407.01573) framework, extending it to support **multi-robot** trajectory optimization through a new algorithm called **D4ORM**(https://arxiv.org/pdf/2503.12204)
 
-[<img src="https://img.shields.io/badge/Backend-Jax-red.svg"/>](https://github.com/google/jax)
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+The original MBD approach was focused on optimizing trajectories for single agents in simulated environments. In D4ORM, we adapt the diffusion model framework to **coordinated multi-robot systems**.
 
-<!-- insert figure -->
-<img src="assets/joint.gif" width="600px"/>
+---
 
-</div>
+## New Files
 
-This repository contains the code for the paper "Model-based Diffusion for Trajectory Optimization".
+The following new files have been added to implement D4ORM:
 
-Model-based diffusion (MBD) is a novel **diffusion-based trajectory optimization** framework that employs a **dynamics model** to approximate the score function. 
-MBD outperforms existing methods (including RL) in terms of sample efficiency and generalization.
+- `multi_car.py` 
+➔ Defines a **multi-robot 2D environment** where multiple robots move and avoid collisions.
+
+- `run_multicar.py` 
+➔ Runs the MBD **diffusion process** over multi-robot trajectories
+
+- `iterative.py` 
+➔ Implements the **D4ORM algorithm**
 
 ## Installation
 
-To install the required packages, run the following command:
+Install the required packages by running:
 
 ```bash
-git clone --depth 1 git@github.com:LeCAR-Lab/model-based-diffusion.git
+git clone https://github.com/Atram19/D4ORM.git
+
 pip install -e .
-```
 
-## Usage
+Make sure you have JAX and Optax installed to run the code.
 
-### Model-based Diffusion for Trajectory Optimization
+If you encounter an error like:
 
-To run model-based diffusion to optimize a trajectory, run the following command:
+jax._src.xla_bridge:909: An NVIDIA GPU may be present on this machine, but a CUDA-enabled jaxlib is not installed. Falling back to cpu.
 
-```bash
-cd mbd/planners
-python mbd_planner.py --env_name $ENV_NAME
-```
+you can fix it by installing JAX with CUDA support:
 
-where `$ENV_NAME` is the name of the environment, you can choose from `hopper`, `halfcheetah`, `walker2d`, `ant`, `humanoidrun`, `humanoidstandup`, `humanoidtrack`, `car2d`, `pushT`.
+pip install "jax[cuda12]" optax
 
-To run model-based diffusion combined with demonstrations, run the following command:
 
-```bash
-cd mbd/planners
-python mbd_planner.py --env_name $ENV_NAME --enable_demos
-```
+Usage
 
-Currently, only the `humanoidtrack`, `car2d` support demonstrations.
+To run MBD optimization for multi-robot trajectories:
 
-To run multiple seeds, run the following command:
+cd D4ORM
+python3 -m mbd.planners.run_multicar
 
-```bash
-cd mbd/scripts
-python run_mbd.py --env_name $ENV_NAME
-```
+To run the iterative D4ORM algorithm:
 
-To visualize the diffusion process, run the following command:
-
-```bash
-cd mbd/scripts
-python vis_diffusion.py --env_name $ENV_NAME
-```
-
-Please make sure you have run the planner first to generate the data.
-
-### Model-based Diffusion for Black-box Optimization
-
-To run model-based diffusion for black-box optimization, run the following command:
-
-```bash
-cd mbd/blackbox
-python mbd_opt.py
-```
-
-### Other Baselines
-
-To run RL-based baselines, run the following command:
-
-```bash
-cd mbd/rl
-python train_brax.py --env_name $ENV_NAME
-```
-
-To run other zeroth order trajectory optimization baselines, run the following command:
-
-```bash
-cd mbd/planners
-python path_integral.py --env_name $ENV_NAME --mode $MODE
-```
-
-where `$MODE` is the mode of the planner, you can choose from `mppi`, `cem`, `cma-es`.
-
-## Acknowledgements
-
-* This codebase's environment and RL implementation is built on top of [Brax](https://github.com/google/brax).
-
-## BibTeX
-
-```bibtex
-@misc{pan2024modelbaseddiffusiontrajectoryoptimization,
-      title={Model-Based Diffusion for Trajectory Optimization}, 
-      author={Chaoyi Pan and Zeji Yi and Guanya Shi and Guannan Qu},
-      year={2024},
-      eprint={2407.01573},
-      archivePrefix={arXiv},
-      primaryClass={cs.RO},
-      url={https://arxiv.org/abs/2407.01573}, 
-}
-```
+cd D4ORM
+python3 -m mbd.planners.iterative
