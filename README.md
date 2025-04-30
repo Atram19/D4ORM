@@ -26,7 +26,7 @@ The following new files have been added to implement D4ORM:
 Install the required packages by running:
 
 ```bash
-git clone https://github.com/Atram19/D4ORM.git
+git clone https://github.com/Atram19/multi-robot-model-based-diffusion.git
 
 pip install -e .
 
