@@ -137,7 +137,8 @@ class MultiCar2d:
     def render(self, ax, X: jnp.ndarray, goals: jnp.ndarray = None):
         
         n = X.shape[0]
-        cmap = cm.get_cmap("tab20", n)  
+        cmap = plt.get_cmap('tab20', n)
+ 
         for i in range(n):
             traj = X[i]             
             x, y, theta = traj[-1]  
