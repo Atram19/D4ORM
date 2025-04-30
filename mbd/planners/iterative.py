@@ -35,7 +35,7 @@ def run_diffusion_once(args: Args):
     state_init = reset_env_jit(rng_reset)
 
     # Diffusion noise schedule
-    betas = jnp.linspace(args.beta0, args.betaT, 5)
+    betas = jnp.linspace(args.beta0, args.betaT, 15)
     alphas = 1.0 - betas
     alphas_bar = jnp.cumprod(alphas)
     sigmas = jnp.sqrt(1 - alphas_bar)
@@ -73,7 +73,7 @@ def run_diffusion_once(args: Args):
 
     def reverse(YN, rng):
         Yi = YN
-        for i in reversed(range(1,5)):
+        for i in reversed(range(1,15)):
             carry = (i, rng, Yi)
             (i, rng, Yi), _ = reverse_once(carry, None)
         return Yi  # U^(0)
@@ -177,12 +177,37 @@ def main():
     _, traj = rollout_us(state_init, U_opt)
     traj = jnp.concatenate([state_init.pipeline_state[None], traj], axis=0) # (T,n,3)
     traj = jnp.transpose(traj, (1, 0, 2))  # (n, T, 3)
+    
 
     print("Check collisions during rollout:")
     for t in range(traj.shape[1]):
         if check_inter_robot_collisions(traj[:, t, :], env.Ra):
             print(f"Collision detected at timestep {t}")
-            
+   
+    # linearly interpolate 
+    def interpolate_trajectory_jax(xs: jnp.ndarray, dt_original: float = 0.1, dt_interp: float = 0.01):
+        n, T, d = xs.shape
+        t_max = (T - 1) * dt_original
+        t_interp = jnp.arange(0.0, t_max + dt_interp, dt_interp)  # (T_interp,)
+
+        t_original = jnp.arange(0.0, T * dt_original, dt_original)  
+
+        def interp_single_robot(traj):  # traj: (T, d)
+            def interpolate_one(ti):
+                idx = jnp.floor(ti / dt_original).astype(int)   
+                idx = jnp.clip(idx, 0, T - 2)
+                t0 = t_original[idx]
+                t1 = t_original[idx + 1]
+                x0 = traj[idx]
+                x1 = traj[idx + 1]
+                alpha = (ti - t0) / (t1 - t0)
+                return (1 - alpha) * x0 + alpha * x1
+
+            return jax.vmap(interpolate_one)(t_interp)  # (T_interp, d)
+
+        xs_interp = jax.vmap(interp_single_robot)(xs)  # (n, T_interp, d)
+        return xs_interp, t_interp
+   
     if not args.not_render:
         path = "results/multicar_iterative"
         os.makedirs(path, exist_ok=True)
@@ -202,11 +227,20 @@ def main():
         plt.title("Optimized final trajectory(D4ORM)")
         plt.tight_layout()
         plt.savefig(os.path.join(path, "local_diffusion.png"))
-        print(f"Figura salvata in {path}/rollout.png")
+        print(f"Figura salvata in {path}/local_diffusion.png")
 
-        # Crea video animato
-        xs_np = jnp.array(xs)
+        # Create video
+        # === Interpolation ===
+        if args.high_resolution:
+            print("Interpolating high resolution trajectory for smoother rendering...")
+            xs_interp, t_interp = interpolate_trajectory_jax(xs, dt_original=0.1, dt_interp=0.01)
+            xs_np = jnp.array(xs_interp)
+        else:
+            print("Using original resolution trajectory for rendering...")
+            xs_np = jnp.array(xs)
+        
         n, T, _ = xs_np.shape
+        cmap = plt.get_cmap('tab20', n)
 
         fig, ax = plt.subplots(figsize=(5, 5))
         lines = [ax.plot([], [], 'o', label=f"Robot {i}")[0] for i in range(n)]
@@ -221,16 +255,41 @@ def main():
             for line in lines:
                 line.set_data([], [])
             return lines
+        
+        # Create line and point objects for each robot
+        lines = []     
+        points = []    
+        
+        for i in range(n):  
+            color = cmap(i)
+            line, = ax.plot([], [], lw=2,color = color) 
+            lines.append(line)
 
+            
+            point, = ax.plot([], [], 'o', markersize=6,color = color)  
+            points.append(point)
+
+            if goals is not None:
+                    gx, gy = goals[i, 0], goals[i, 1]
+                    ax.plot(gx, gy, 's', color=color, markersize=6, markeredgewidth=2)
+       
         def update(frame):
-            for i, line in enumerate(lines):
-                x, y = xs_np[i, frame, 0], xs_np[i, frame, 1]
-                line.set_data([x], [y])
-            return lines
+            for i in range(n):
+                x_trail = xs_np[i, :frame + 1, 0]
+                y_trail = xs_np[i, :frame + 1, 1]
+                lines[i].set_data(x_trail, y_trail)
+
+                x_curr = xs_np[i, frame, 0]
+                y_curr = xs_np[i, frame, 1]
+                points[i].set_data([x_curr], [y_curr])
+            return lines + points
 
         ani = animation.FuncAnimation(
-            fig, update, frames=T, init_func=init, blit=True, interval=100
+            fig, update, frames=T, init_func=init, blit=False, interval=100
         )
+        labels = [f"Robot {i}" for i in range(n)]
+        ax.legend(points, labels, loc='upper right')
+
 
         video_path = os.path.join(path, "local_diffusion.mp4")
         ani.save(video_path, fps=10, dpi=150)

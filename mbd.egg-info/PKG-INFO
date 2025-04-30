@@ -1,13 +1,25 @@
-Metadata-Version: 2.1
+Metadata-Version: 2.2
 Name: mbd
 Version: 0.0.1
-Summary: UNKNOWN
-Home-page: UNKNOWN
 Author: Chaoyi Pan
 Author-email: chaoyip@andrew.cmu.edu
-License: UNKNOWN
-Platform: UNKNOWN
 License-File: LICENSE
-
-UNKNOWN
-
+Requires-Dist: brax
+Requires-Dist: gym
+Requires-Dist: pandas
+Requires-Dist: seaborn
+Requires-Dist: matplotlib
+Requires-Dist: imageio
+Requires-Dist: control
+Requires-Dist: tqdm
+Requires-Dist: tyro
+Requires-Dist: meshcat
+Requires-Dist: sympy
+Requires-Dist: gymnax
+Requires-Dist: jax
+Requires-Dist: distrax
+Requires-Dist: gputil
+Requires-Dist: jaxopt
+Dynamic: author
+Dynamic: author-email
+Dynamic: requires-dist
