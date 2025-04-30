@@ -45,10 +45,10 @@ Usage
 
 To run MBD optimization for multi-robot trajectories:
 
-cd D4ORM
+cd multi-robot-model-based-diffusion
 python3 -m mbd.planners.run_multicar
 
 To run the iterative D4ORM algorithm:
 
-cd D4ORM
+cd multi-robot-model-based-diffusion
 python3 -m mbd.planners.iterative
