@@ -12,6 +12,8 @@ from mbd.envs import MultiCar2d
 import tyro
 import numpy as np
 import time
+
+import pickle
 # Single-pass reverse diffusion to initialize U
 def run_diffusion_once(args: Args,env, rollout_us, reset_env_jit):
     """
@@ -57,7 +59,7 @@ def run_diffusion_once(args: Args,env, rollout_us, reset_env_jit):
         logp0 = (rews - rews.mean()) / rew_std / args.temp_sample
 
         # Weighted average of samples  (Monte carlo estimate)
-        weights = jax.nn.softmax(logp0)
+        weights = jax.nn.softmax(logp0) # trasformazione in pesi 
         Ybar = jnp.einsum("s,shij->hij", weights, Y0s)
         # Reverse diffusion step
         score = 1 / (1.0 - alphas_bar[i]) * (-Yi + jnp.sqrt(alphas_bar[i]) * Ybar)
@@ -74,6 +76,13 @@ def run_diffusion_once(args: Args,env, rollout_us, reset_env_jit):
 
     rng_exp, rng = jax.random.split(rng)
     U_0 = reverse(YN, rng_exp)
+    state_init_eval = reset_env_jit(jax.random.PRNGKey(args.seed + 1024))
+    rewss_eval, _ = rollout_us(state_init_eval, U_0)
+
+    reward_per_robot = rewss_eval.mean(axis=0)
+   
+    reward_array_str = "[" + ", ".join(f"{r:.4f}" for r in reward_per_robot) + "]"
+    print(f"[global robots average rewards: {reward_array_str}")
     return U_0
 
 # Local iterative diffusion optimization
@@ -84,7 +93,6 @@ def run_diffusion_local(args: Args, U_init: jnp.ndarray,env, rollout_us, reset_e
     """
     rng = jax.random.PRNGKey(seed=args.seed + 123)  # different seed for local phase
     rewards_per_iter = []
-    
     H = args.Hsample
     Nu = env.action_size
     n = env.num_robots
@@ -104,129 +112,151 @@ def run_diffusion_local(args: Args, U_init: jnp.ndarray,env, rollout_us, reset_e
 
     sigma_local = sigmas_local[-1]
 
-    lambda_goal = jnp.zeros((n * 2,))
+    
+    lambda_goal = jnp.zeros((env.n * 2,))
 
-    for k in range(K):
-        for t_start in range(0, H - L + 1, L // 2):  # sliding overlapping windows
+
+    # Preparazione funzioni
+    state_init_for_goal = reset_env_jit(jax.random.PRNGKey(args.seed + 777))
+    residual_fn = make_residual_fn(state_init_for_goal, env, args.Nsample)
+    lagrangian_fn = make_lagrangian_fn(state_init_for_goal, env, args.Nsample)
+    R_window_all = []
+    J_goal_all = []
+    J_barrier_all = []
+    J_control_all = []
+    H_norm_all = []
+
+      
+    def reverse_once_local_hybrid(U_window, rng_w, U_full_template, t_start, residual_fn, lagrangian_fn, lambda_goal, args, env,sigma_k):
+        Nsample = args.Nsample
+        L, n, Nu = U_window.shape
+        sigma_local = sigma_k # o 0.2
+   
+        # Step 1: Sampling (diffusion-based denoising)
+        eps_u = jax.random.normal(rng_w, (Nsample, L, n, Nu))
+        Y0s = eps_u * sigma_local + U_window
+        noise = eps_u*sigma_local
+        noise_norm = jnp.linalg.norm(noise.reshape(Nsample, -1), axis=1).mean()
+        Y0s = jnp.clip(Y0s, -1.0, 1.0)
+
+        # Step 2: Costruisci rollouts completi modificando la finestra
+        U_fulls = jnp.repeat(U_full_template[None, ...], Nsample, axis=0)
+        U_fulls = U_fulls.at[:, t_start:t_start+L, :, :].set(Y0s)
+      
+        Y0s_window = Y0s[:, t_start:t_start+L, :, :]
+        state_init = env.reset(jax.random.PRNGKey(args.seed +1024))  
+        rewss, pipeline_states = jax.vmap(rollout_us, in_axes=(None, 0))(state_init, U_fulls)
+        pipeline_states_window = pipeline_states[:, t_start:t_start+L]
+        r_vals_window = rewss[:, t_start:t_start+L, :].mean(axis=(1,2))
+        # Step 3: Calcola loss Lagrangiana come score
+        L_cost,L_constraint,L_tot,control_cost,barrier_cost,goal_cost,h_flat = lagrangian_fn(Y0s_window,Y0s, pipeline_states, pipeline_states_window, lambda_goal, args.mu)
+
+        
+        alpha = 1.0  
+        r_std = (r_vals_window - r_vals_window.mean()) / (r_vals_window.std() + 1e-6)
+        L_std = (L_cost - L_cost.mean()) / (L_cost.std() + 1e-6)
+        
+        score_vals = r_std - alpha * L_std
+   
+        logp0 = (score_vals - score_vals.mean()) / (score_vals.std() + 1e-6) / args.temp_sample
+        weights = jax.nn.softmax(logp0)
+        
+   
+        U_soft = jnp.einsum("s,slij->lij", weights, Y0s)
+
+        # # Step 2: gradiente REINFORCE su L_constraint
+        
+        grad = jnp.einsum("s,slij->lij", (L_tot - L_tot.mean()), noise)
+        grad = grad / (Nsample * sigma_local**2 + 1e-6)
+        
+
+    #     # === Rollout singolo su U_soft ===
+       
+    #     U_soft_batched = jnp.repeat(U_soft[None, ...], Nsample, axis=0)  
+    #     U_full_soft = jnp.repeat(U_full_template[None, ...], Nsample, axis=0)
+    #     U_full_soft = U_full_soft.at[:, t_start:t_start+L, :, :].set(U_soft_batched)
+
+    #     # Rollout batch con traiettoria centrale
+    #     state_init_eval = env.reset(jax.random.PRNGKey(args.seed + 1024))
+    #     rewss_soft, pipeline_states_soft = jax.vmap(rollout_us, in_axes=(None, 0))(state_init_eval, U_full_soft)
+    #     pipeline_states_window_soft = pipeline_states_soft[:, t_start+1:t_start+L+1, :, :]
+
+    #     # === Lagrangiana su batch centrale (identico in tutti i sample) ===
+    #     _, _, L_base, *_ = lagrangian_fn(
+    #         U_soft_batched,               
+    #         U_soft_batched,              
+    #         pipeline_states_soft[:, 1:], 
+    #         pipeline_states_window_soft,
+    #         lambda_goal,
+    #         args.mu
+    #     )
+
+    #     L_x = L_base  # shape: (Nsample,)
+
+
+    #    # # REINFORCE-style gradient
+    #     grad = jnp.einsum("s,slij->lij", (L_tot - L_x), noise)
+    #     grad = grad / (Nsample * sigma_local**2 + 1e-6)
+
+        U_next = U_soft - 0.01* grad
+       
+        
+        h_goal = residual_fn(pipeline_states)  
+        h_mean = jnp.mean(h_goal, axis=0).reshape(-1)
+        
+        lambda_goal = lambda_goal + args.alpha * args.mu * h_mean
+                
+        
+        # print("L_cost mean/std:", L_cost.mean(), L_cost.std())
+        # print("r_vals_window mean/std:", r_vals_window.mean(), r_vals_window.std())
+
+
+        return U_next, lambda_goal,r_vals_window, goal_cost, barrier_cost, control_cost, h_flat
+    
+    
+    noise_norm = []
+    for i in range(8):  # numero iterazioni locali
+        
+        sigma_0 = args.initial_sigma
+        gamma = 0.66
+        sigma_k = sigma_0 * jnp.exp(-gamma * i)
+        noise_norm.append(sigma_k)
+        for t_start in range(0, H - L + 1, L // 2):
             t_end = t_start + L
             U_window = U[t_start:t_end]
-
             rng, rng_step = jax.random.split(rng)
 
-            # Local reverse diffusion inside the window
-            def reverse_once_local(U_w, rng_w):
-                eps_u = jax.random.normal(rng_w, (args.Nsample, L, n, Nu))
-
-                Y0s = eps_u * sigma_local + U_w
-                Y0s = jnp.clip(Y0s, -1.0, 1.0)
-
-                # Insert modified window into full control sequences
-                U_fulls = jnp.repeat(U[None, ...], args.Nsample, axis=0)
-                U_fulls = U_fulls.at[:, t_start:t_end, :, :].set(Y0s)
-                #  Evaluate new rollouts
-                state_init = reset_env_jit(rng_step)
-                rewss, _ = jax.vmap(rollout_us, in_axes=(None, 0))(state_init, U_fulls)
-                rews = rewss.mean(axis=(1, 2))
-
-                # Compute weighted average of samples
-                logp0 = (rews - rews.mean()) / (rews.std() + 1e-6) / args.temp_sample
-                weights = jax.nn.softmax(logp0)
-                U_opt = jnp.einsum("s,slij->lij", weights, Y0s)
-
-                return U_opt
-
-            U_opt_local = reverse_once_local(U_window, rng_step)
+            U_opt_local, lambda_goal,r_vals_window, goal_cost, barrier_cost, control_cost, h_flat = reverse_once_local_hybrid(U_window, rng_step,U, t_start, residual_fn,lagrangian_fn,lambda_goal,args,env,sigma_k)
+            
+            R_window_all.append(np.array(r_vals_window))
+            J_goal_all.append(np.array(goal_cost))
+            J_barrier_all.append(np.array(barrier_cost))
+            J_control_all.append(np.array(control_cost))
+            H_norm_all.append(np.linalg.norm(h_flat.reshape(h_flat.shape[0], -1), axis=1))
             U = U.at[t_start:t_end].set(U_opt_local)
-            # Print mean reward per robot after window optimization
+       
         state_init_eval = reset_env_jit(jax.random.PRNGKey(args.seed + 1024))
         rewss_eval, _ = rollout_us(state_init_eval, U)
 
         reward_per_robot = rewss_eval.mean(axis=0)
         rewards_per_iter.append(np.array(reward_per_robot))
         reward_array_str = "[" + ", ".join(f"{r:.4f}" for r in reward_per_robot) + "]"
-        print(f"[Iteration {k}] robots average rewards: {reward_array_str}")
+        print(f"[Iteration {i}] robots average rewards: {reward_array_str}")
+    # print("Salvataggio iterazione", i)
+    # print("Shape R_window_all[0]:", J_control_all[0].shape)
+    # print("Len R_window_all:", len(J_control_all))
 
-    def reverse_once_local_ECD(U_w, rng_w, lambda_goal, residual_fn, lagrangian):
-            Nsample = args.Nsample
-            N_inner = 30  # number of ECD iterations
-            U_curr = U_w
-            lambda_curr = lambda_goal
-            delta_t = 0 
-            for i in range(N_inner):
+    np.savez("results/multicar_iterative/trend_samples_iter_7.npz",
+        R_window=np.stack(R_window_all),
+        J_goal=np.stack(J_goal_all),
+        J_barrier=np.stack(J_barrier_all),
+        J_control=np.stack(J_control_all),
+        H_norm=np.stack(H_norm_all),noise_norm=np.stack(noise_norm))
 
-                rng_w, rng_step = jax.random.split(rng_w)
-                # Noise annealing: exponentially decaying, then set to 0 in last 2 steps
-                sigma_k = args.initial_sigma * jnp.exp(-args.noise_decay * i)
-                sigma_k = jnp.where(i >= N_inner - 2, 0.0, sigma_k)
-                mu_k = args.mu
-
-                # Sample noisy control trajectories generated with gaussian noise
-                eps_u = jax.random.normal(rng_step, (Nsample, L, n, Nu))
-                noise = eps_u * sigma_k
-                Y0s = U_curr + noise
-                Y0s = jnp.clip(Y0s, -1.0, 1.0)
-                
-                U_fulls = jnp.repeat(U[None, ...], Nsample, axis=0)
-                U_fulls = U_fulls.at[:, t_start:t_start + L, :, :].set(Y0s)
-                Y0s_windows = Y0s[:, t_start:t_start + L, :, :]
-                t1 = time.time()
-                state_init = reset_env_jit(rng_w)
-                rewss, pipeline_states = jax.vmap(rollout_us, in_axes=(None, 0))(state_init, U_fulls)
-                t2 = time.time()
-                delta_t += t2-t1 
-                pipeline_states_window = pipeline_states[:, t_start:t_start+L]
-
-                # Compute Lagrangian values for each sample
-               # L_vals = lagrangian(Y0s, pipeline_states, lambda_curr, args.mu)
-                L_cost,L_constraint,L_vals,control_cost,barrier_cost,goal_cost,h_flat = lagrangian(Y0s_windows,Y0s, pipeline_states, pipeline_states_window, lambda_curr, args.mu)
-
-                # Estimate gradient using score function estimator
-                grad = jnp.einsum("s,slij->lij", L_vals - L_vals.mean(), noise)
-                grad = grad / (Nsample * sigma_k ** 2 + 1e-8) # direzione del gradiente
-
-                # === Clipping gradient
-                # grad_norm = jnp.linalg.norm(grad)
-                # grad = jnp.where(grad_norm > 1.0, grad * (1.0 / grad_norm), grad)
-
-                # Update control using gradient descent and clip to [-1, 1]
-                U_next = U_curr - args.alpha * grad
-                U_next = jnp.clip(U_next, -1.0, 1.0)
-
-                # Update Lagrange multipliers based on average residual
-                h_goal = residual_fn(pipeline_states)
-                h_mean = jnp.mean(h_goal, axis=0).reshape(-1)
-                lambda_next = lambda_curr + args.alpha * mu_k * h_mean
-
-                
-                U_curr = U_next
-                lambda_curr = lambda_next
-            # print(f"Initial reverse diffusion time: {delta_t:.3f} s")
-            return U_curr, lambda_curr
-
-    if args.ECD:
-        state_init_for_goal = reset_env_jit(jax.random.PRNGKey(args.seed + 777))
-        residual_fn = make_residual_fn(state_init_for_goal, env, args.Nsample)
-        lagrangian = make_lagrangian_fn(state_init_for_goal, env, args.Nsample)
-        print("ECD finale")
-
-        final_ecd_iters = 8
-        for i in range(final_ecd_iters):
-            for t_start in range(0, H - L + 1, L // 2):
-            #for t_start in range(H - 5*L, H - L + 1, L // 2): # 9 windows, starting from 50 overlapping every 5
-                t_end = t_start + L
-                U_window = U[t_start:t_end]
-                rng, rng_step = jax.random.split(rng)
-                U_opt_local, lambda_goal = reverse_once_local_ECD(U_window, rng_step, lambda_goal,residual_fn, lagrangian)
-                U = U.at[t_start:t_end].set(U_opt_local)
-
-            state_init_eval = reset_env_jit(jax.random.PRNGKey(args.seed + 999))
-            rewss_eval, _ = rollout_us(state_init_eval, U)
-            reward_per_robot = rewss_eval.mean(axis=0)
-            rewards_per_iter.append(np.array(reward_per_robot))
-            reward_array_str = "[" + ", ".join(f"{r:.4f}" for r in reward_per_robot) + "]"
-            print(f"[Iteration {i}] robots average rewards: {reward_array_str}")
+        
 
     return U,rewards_per_iter
+   
 
 def main():
     args = tyro.cli(Args)
@@ -239,15 +269,21 @@ def main():
     step_env_jit = jax.jit(env.step)
     reset_env_jit = jax.jit(env.reset)
     rollout_us = jax.jit(functools.partial(rollout_multi_us, step_env_jit))
-
+   
     t1 = time.time()
+    
     U_init = run_diffusion_once(args,env, rollout_us, reset_env_jit)
+    
+
     t2 = time.time()
     print(f"Initial reverse diffusion time: {t2 - t1:.3f} s")
 
     print("STEP 2: Iterative Local Optimization")
     t3 = time.time()
+ 
     U_opt, rewards_per_iter = run_diffusion_local(args, U_init, env, rollout_us, reset_env_jit)
+    
+   
     t4 = time.time()
     print(f"Local optimization time: {t4 - t3:.3f} s")
 
@@ -261,12 +297,11 @@ def main():
     print("STEP 3: Rollout with optimized controls")
 
 
-    state_init = reset_env_jit(jax.random.PRNGKey(args.seed + 999))
+    state_init = reset_env_jit(jax.random.PRNGKey(args.seed + 1024))
     _, traj = rollout_us(state_init, U_opt)
     traj = jnp.concatenate([state_init.pipeline_state[None], traj], axis=0)
     traj = jnp.transpose(traj, (1, 0, 2))
 
-    #print(f"Total runtime: {time.time() - start_time:.2f} s")
 
     print("Check collisions during rollout:")
     for t in range(traj.shape[1]):
@@ -312,7 +347,7 @@ def main():
         os.makedirs(path, exist_ok=True)
 
 
-        state_init = reset_env_jit(jax.random.PRNGKey(args.seed + 999))
+        state_init = reset_env_jit(jax.random.PRNGKey(args.seed + 1024))
         xs = jnp.array([state_init.pipeline_state])
         state = state_init
         for t in range(U_opt.shape[0]):
@@ -327,7 +362,7 @@ def main():
 
         env.render(ax, xs, goals=env.xg)
         
-        ecd_tag = "ecd" if args.ECD else "d4orm"
+        ecd_tag =  "d4orm+ECD"
         formation_tag = "form" if args.formation_shift else ""
         plt.title(f"Optimized final trajector {ecd_tag}_{formation_tag}")
         plt.tight_layout()
@@ -447,8 +482,12 @@ def main():
         video_path = os.path.join(path, f"local_diffusion_{ecd_tag}_{formation_tag}.mp4")
         ani.save(video_path, fps=10, dpi=150)
         print("Video saved in:", video_path)
-
+        
 
 
 if __name__ == "__main__":
     main()
+
+
+
+   

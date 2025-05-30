@@ -1,3 +1,6 @@
 .venv/
 *.mp4
 __pycache__/
+*.npz
+*.png
+results/

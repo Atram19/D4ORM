@@ -3,7 +3,6 @@ import os
 import jax
 from jax import numpy as jnp
 from jax import config
-from dataclasses import dataclass
 import tyro
 from tqdm import tqdm
 from matplotlib import pyplot as plt
@@ -14,25 +13,14 @@ from mbd.envs.multi_car import check_inter_robot_collisions
 import matplotlib.animation as animation
 
 
-# Define command-line arguments
-@dataclass
-class Args:
-    seed: int = 0
-    n_robots: int = 4
-    Nsample: int = 2048         # number of samples
-    Hsample: int = 100          # horizon
-    Ndiffuse: int = 100         # number of diffusion steps
-    temp_sample: float = 0.1    # temperature for sampling
-    beta0: float = 1e-4         # initial noise
-    betaT: float = 1e-2         # final noise
-    not_render: bool = False
-    high_resolution: bool = False
+
+
 
 # Diffusion-based optimization process for multi-robot trajectory planning
 def run_diffusion(args: Args):
 
     rng = jax.random.PRNGKey(seed=args.seed)
-    env = MultiCar2d(n=args.n_robots)
+    env = MultiCar2d(n=args.n_robots,formation_shift=args.formation_shift)
 
     Nx = env.observation_size
     Nu = env.action_size
@@ -129,9 +117,9 @@ def run_diffusion(args: Args):
                 alpha = (ti - t0) / (t1 - t0)
                 return (1 - alpha) * x0 + alpha * x1
 
-            return jax.vmap(interpolate_one)(t_interp)  # (T_interp, d)
+            return jax.vmap(interpolate_one)(t_interp)
 
-        xs_interp = jax.vmap(interp_single_robot)(xs)  # (n, T_interp, d)
+        xs_interp = jax.vmap(interp_single_robot)(xs)  
         return xs_interp, t_interp
    
 
@@ -148,7 +136,7 @@ def run_diffusion(args: Args):
         for t in range(Yi.shape[1]):
             state = step_env_jit(state, Yi[-1, t])
             xs = jnp.concatenate([xs, state.pipeline_state[None]], axis=0)
-        xs = jnp.transpose(xs, (1, 0, 2))  # shape: (n, H+1, 3)
+        xs = jnp.transpose(xs, (1, 0, 2))  
 
         print("Check collisions during rollout:")
         for t in range(xs.shape[1]):
@@ -181,9 +169,22 @@ def run_diffusion(args: Args):
         
 
 
-        ax.set_xlim(-3, 3)
-        ax.set_ylim(-3, 3)
+        # Calcola bounding box della traiettoria
+        x_all = xs_np[:, :, 0].flatten()
+        y_all = xs_np[:, :, 1].flatten()
+
+        x_min, x_max = x_all.min(), x_all.max()
+        y_min, y_max = y_all.min(), y_all.max()
+
         ax.set_title("Robot tracking")
+        if args.formation_shift:
+            c0 = env.x0[:, :2].mean(axis=0)
+            circle0 = plt.Circle((c0[0], c0[1]), env.radius, color='gray', linestyle='--', fill=False)
+            ax.add_patch(circle0)
+            cg = env.xg[:, :2].mean(axis=0)
+            circleg = plt.Circle((cg[0], cg[1]), env.radius, color='black', linestyle='--', fill=False)
+            ax.add_patch(circleg)
+
         ax.legend()
        
         # Create line and point objects for each robot
