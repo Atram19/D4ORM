@@ -1,4 +1,3 @@
-
 import jax
 from jax import numpy as jnp
 from flax import struct
@@ -6,12 +5,40 @@ from functools import partial
 import matplotlib.pyplot as plt
 import mbd
 import matplotlib.cm as cm
+from dataclasses import dataclass
+
+# Define command-line arguments
+@dataclass
+class Args:
+    seed: int = 0
+    n_robots: int = 4
+    Nsample: int = 2048         # number of samples
+    Hsample: int = 100          # horizon
+    Ndiffuse: int = 100         # number of diffusion steps
+    temp_sample: float = 0.1    # temperature for sampling
+    beta0: float = 1e-4         # initial noise
+    betaT: float = 1e-2         # final noise
+    # ECD parameters
+    goal_lambda : float = 200     # lagrangian multiplier
+    collision_lambda: float = 100 # lagrangian multiplier
+    initial_sigma: float = 1   # initial gaussian noise
+    alpha: float = 0.01         # optimization step size
+    mu: float = 50             # penalty term
+    noise_decay: float = 0.3    # decay factor for noise
+    not_render: bool = False
+    high_resolution: bool = False
+    ECD : bool = False
+    formation_shift: bool = False 
+    T: int = 30
+    save_video: bool = False 
+
+
 def car_dynamics(x, u):
     # x = x.at[3].set(jnp.clip(x[3], -2.0, 2.0))
     return jnp.array(
         [
-            u[1] * jnp.sin(x[2])*3.0,  # x_dot
-            u[1] * jnp.cos(x[2])*3.0,  # y_dot
+            u[1] * jnp.cos(x[2])*3.0,  # x_dot  # CAMBIO DINAMICA
+            u[1] * jnp.sin(x[2])*3.0,  # y_dot
             u[0] * jnp.pi / 3 * 2.0,  # theta_dot
             # u[1] * 6.0,  # v_dot
         ]
@@ -34,23 +61,51 @@ def check_inter_robot_collisions(X_t, Ra):
     dists = jnp.linalg.norm(pos[:, None, :] - pos[None, :, :], axis=-1)               # Compute the pairwise distance matrix between all robots using broadcasting.
     collision_matrix = dists < 2 * Ra                                                 # Create a collision matrix: True if distance < 2 * Ra, False otherwise.
     collision_matrix = collision_matrix.at[jnp.diag_indices(pos.shape[0])].set(False) # Ignore self-collisions by setting diagonal to False.
-    return jnp.any(collision_matrix)  
+    return bool(jnp.any(collision_matrix))
 
 # Generate initial and goal positions for n robots arranged in antipodal pairs on a circle.
 
-def antipodal_positions(n, radius=2.0):
+def antipodal_positions(n, radius):
     angles = jnp.linspace(0, 2 * jnp.pi, n, endpoint=False)
     x0_xy = jnp.stack([
         radius * jnp.cos(angles),
         radius * jnp.sin(angles)
     ], axis=1)
     xg_xy = -x0_xy
-    theta0 = jnp.zeros(n) 
-    theta_g = jnp.zeros(n)  
+    #theta0 = jnp.zeros(n) 
+    # theta0 = jnp.ones(n) * (jnp.pi / 2)
+
+    # theta_g = jnp.zeros(n)  
+     # Calcolo dell'orientamento iniziale: angolo tra x0 e xg
+    delta = xg_xy - x0_xy
+    theta0 = jnp.arctan2(delta[:, 1], delta[:, 0])  # orientati verso il goal
+
+    # Orientamento finale (opzionale): verso il centro o verso -x0?
+    theta_g = jnp.arctan2(delta[:, 1], delta[:, 0])  
+    
     x0 = jnp.hstack([x0_xy, theta0[:, None]])
     xg = jnp.hstack([xg_xy, theta_g[:, None]])
-    print(f"Initial states:\n{x0}\nFinal states:\n{xg}")
+    # print(f"Initial states:\n{x0}\nFinal states:\n{xg}")
     return x0, xg
+
+#  Shifts the entire robot formation while maintaining relative positions on the circle
+
+def circular_shift_goals(n,radius, shift=(0.0, 3.0)):
+        
+        angles = jnp.linspace(0, 2 * jnp.pi, n, endpoint=False)
+        C_start = jnp.array([0.0, 0.0])
+        C_goal = C_start + jnp.array(shift)
+
+        x0_xy = C_start + radius * jnp.stack([jnp.cos(angles), jnp.sin(angles)], axis=1)
+        xg_xy = C_goal + radius * jnp.stack([jnp.cos(angles), jnp.sin(angles)], axis=1)
+        directions = xg_xy - x0_xy
+        theta0 = jnp.arctan2(directions[:, 1], directions[:, 0])
+
+        x0 = jnp.hstack([x0_xy, theta0[:, None]])
+        xg = jnp.hstack([xg_xy, theta0[:, None]])
+
+        return x0, xg
+        
 
 @struct.dataclass
 class State:
@@ -60,16 +115,21 @@ class State:
     done: jnp.ndarray            # optional : goal reached 
 
 class MultiCar2d:
-    def __init__(self, n, radius=2.0, robot_radius=0.1):
+    def __init__(self, n, radius=2.0, robot_radius=0.1,formation_shift = False):
         self.n = n              # number of robots
         self.dt = 0.1           # time step
         self.H = 100            # horizon
         self.Ra = robot_radius  # radius of the robot
-        self.radius = radius    # eadius of the initial circle
+        self.radius = radius   # radius of the initial circle
         self.wt = 2             # weight for the reward function
-
-        self.x0, self.xg = antipodal_positions(n, radius=self.radius)
-
+        self.formation_shift = formation_shift
+        
+        
+        if self.formation_shift:
+            self.x0,self.xg = circular_shift_goals(n,radius = self.radius, shift=(0, 3.0))
+        else:
+            self.x0, self.xg = antipodal_positions(n, radius=self.radius)
+    
     # reset the state of the environment to an initial state
     def reset(self, rng):
             return State(
@@ -95,28 +155,45 @@ class MultiCar2d:
             )  
 
             # Calculate the reward 
-            reward = self.get_rewards(q_new)  # (n,)
-
+            reward = self.get_rewards(q_new,action)  # (n,)
+        
             return state.replace(pipeline_state=q_new, obs=q_new, reward=reward, done=jnp.zeros((self.n,)))
 
     # Calculate the reward 
     @partial(jax.jit, static_argnums=(0,))
-    def get_rewards(self, q_all):
+    def get_rewards(self, q_all, u_all):
         """
-        Compute the reward for each robot based on its current state and the states of all robots.
-
+        Compute the reward for each robot based on its current state, actions and the states of all robots.
         """
-        def single_reward(k, q):
-             p = q[:2]
-             pT = self.xg[k][:2]
-             p0 = self.x0[k][:2] 
-             r_goal = 1.0 - jnp.linalg.norm(p - pT) / jnp.linalg.norm(p0 - pT) # r_goal = 1.0 - distance to goal / initial distance
 
-             dists = jnp.linalg.norm(p - q_all[:, :2], axis=1)
-             r_safe = -1.0 * jnp.any((dists <= 2 * self.Ra + 1e-2) & (jnp.arange(self.n) != k)) # r_safe = -1.0 if any other robot is too close
-             return r_goal + self.wt * r_safe
+        def single_reward(k, q,u_all):
+            u_k = u_all[k]  # action of the k-th robot
+            p = q[:2]
+            pT = self.xg[k][:2]
+            p0 = self.x0[k][:2] 
+            r_goal = 1.0 - jnp.linalg.norm(p - pT) / jnp.linalg.norm(p0 - pT)
 
-        return jax.vmap(single_reward, in_axes=(0, 0))(jnp.arange(self.n), q_all)
+            dists = jnp.linalg.norm(p - q_all[:, :2], axis=1)
+            r_safe = -1.0 * jnp.any((dists <= 2 * self.Ra + 1e-2) & (jnp.arange(self.n) != k))
+
+            def rews_formation(q_all, x0_all):
+                pos = q_all[:, :2]
+                pos0 = x0_all[:, :2]
+                diff = pos[:, None, :] - pos[None, :, :]
+                diff0 = pos0[:, None, :] - pos0[None, :, :]
+                dists = jnp.linalg.norm(diff, axis=-1)
+                dists0 = jnp.linalg.norm(diff0, axis=-1)
+                mask = jnp.triu(jnp.ones((self.n, self.n), dtype=bool), k=1)
+                return jnp.mean((dists - dists0) ** 2 * mask)
+
+            r_form = -rews_formation(q_all, self.x0) if self.formation_shift else 0.0
+
+            r_control =  - jnp.sum(u_k ** 2)  # penalizzazione sul controllo
+
+            return r_goal + self.wt * r_safe + r_form + 0.1*r_control
+
+        return jax.vmap(single_reward, in_axes=(0, 0, 0))(jnp.arange(self.n), q_all, u_all)
+
     
     # size of the action space
     @property
@@ -133,6 +210,8 @@ class MultiCar2d:
     def num_robots(self):
         return self.n
     
+    
+
     #  Function for visualizing the environment
     def render(self, ax, X: jnp.ndarray, goals: jnp.ndarray = None):
         
@@ -162,9 +241,17 @@ class MultiCar2d:
             dy = 0.3 * jnp.sin(theta)
             ax.arrow(x, y, dx, dy, head_width=0.1, head_length=0.15, fc=color, ec=color)
         
-        ax.set_aspect('equal')
+        ax.set_aspect('equal', adjustable='box')
         ax.grid(True)
+        
+        # Display the two circles
+        if self.formation_shift:
+                c0 = self.x0[:, :2].mean(axis=0)
+                circle0 = plt.Circle((c0[0], c0[1]), self.radius, color='gray', linestyle='--', fill=False)
+                ax.add_patch(circle0)
+                cg = self.xg[:, :2].mean(axis=0)
+                circleg = plt.Circle((cg[0], cg[1]), self.radius, color='black', linestyle='--', fill=False)
+                ax.add_patch(circleg)
+
         ax.legend(loc='center left', bbox_to_anchor=(1, 0.5), fontsize=8)
 
-
-    

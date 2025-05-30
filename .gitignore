@@ -1,2 +1,9 @@
 .venv/
 *.mp4
+<<<<<<< HEAD
+=======
+__pycache__/
+*.npz
+*.png
+results/
+>>>>>>> ottimizzazione-visuale

@@ -33,7 +33,11 @@ Make sure you have JAX and Optax installed to run the code.
 
 If you encounter an error like:
 
+<<<<<<< HEAD
 ```
+=======
+``` bash
+>>>>>>> ottimizzazione-visuale
 jax._src.xla_bridge:909: An NVIDIA GPU may be present on this machine, but a CUDA-enabled jaxlib is not installed. Falling back to cpu.
 ```
 

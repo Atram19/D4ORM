@@ -10,7 +10,11 @@ import matplotlib.animation as animation
 
 import mbd
 from mbd.envs import MultiCar2d
+<<<<<<< HEAD
 from mbd.planners.run_multicar import Args
+=======
+from mbd.envs.multi_car import  Args
+>>>>>>> ottimizzazione-visuale
 
 def run_diffusion(args: Args):
     rng = jax.random.PRNGKey(seed=args.seed)

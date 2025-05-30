@@ -10,8 +10,13 @@ from tqdm import tqdm
 
 from mbd.envs import MultiCar2d
 from mbd.utils import rollout_multi_us
+<<<<<<< HEAD
 from mbd.envs.multi_car import check_inter_robot_collisions
 from mbd.planners.run_multicar import run_diffusion, Args
+=======
+from mbd.envs.multi_car import  Args
+
+>>>>>>> ottimizzazione-visuale
 
 def run_diffusion_once(args: Args):
     """
@@ -133,7 +138,11 @@ def run_diffusion_local(args: Args, U_init: jnp.ndarray, trajectory_buffer: list
             U_window = U[t_start:t_end]
 
             rng, rng_step = jax.random.split(rng)
+<<<<<<< HEAD
 
+=======
+           
+>>>>>>> ottimizzazione-visuale
             def reverse_once_local(U_w, rng_w):
                 eps_u = jax.random.normal(rng_w, (args.Nsample, L, n, Nu))
                 Y0s = eps_u * sigma_local + U_w
@@ -152,7 +161,13 @@ def run_diffusion_local(args: Args, U_init: jnp.ndarray, trajectory_buffer: list
 
                 return U_opt, qss
 
+<<<<<<< HEAD
             U_opt_local, qss = reverse_once_local(U_window, rng_step)
+=======
+            
+            U_opt_local, qss = reverse_once_local(U_window, rng_step)
+           
+>>>>>>> ottimizzazione-visuale
             U = U.at[t_start:t_end].set(U_opt_local)
 
             # save the states obtained from the sampled actions
