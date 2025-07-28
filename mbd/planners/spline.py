@@ -12,11 +12,99 @@ from mbd.envs import MultiCar2d
 import tyro
 import numpy as np
 import time
-from mbd.butterworth import butterworth_filter_numpy,ar1_noise_numpy
-from mbd.butterworth import get_butterworth_coeffs
 
-    # Single-pass reverse diffusion to initialize U
-def ar1_noise(key, shape, rho=0.99999):
+
+# jax.config.update("jax_debug_nans", True)
+
+def cubic_spline_weights(x, t_knots):
+    """
+    Calcola i pesi per interpolazione cubica lineare su punti equispaziati.
+    x: array di dimensione (H,) in cui valutare
+    t_knots: array dei nodi spline (Nknots,)
+    Return: (H, Nknots) matrice dei pesi
+    """
+    N = t_knots.shape[0]
+    H = x.shape[0]
+
+    # Costruisci basi spline cubiche locali (uniformi, non periodiche)
+    dx = t_knots[1] - t_knots[0]  # passo costante
+    u = (x[:, None] - t_knots[None, :]) / dx  # distanza normalizzata
+
+    # Cubic B-spline basis (uniforme): funzione φ(u)
+    def phi(u):
+        absu = jnp.abs(u)
+        return jnp.where(
+            absu < 1,
+            1.5 * absu**3 - 2.5 * absu**2 + 1,
+            jnp.where(
+                absu < 2,
+                -0.5 * absu**3 + 2.5 * absu**2 - 4 * absu + 2,
+                0.0
+            )
+        )
+    def b_spline_cubic(u):
+        absu = jnp.abs(u)
+        return jnp.where(
+            absu < 1,
+            (2/3) - absu**2 + 0.5 * absu**3,
+            jnp.where(
+                (absu >= 1) & (absu < 2),
+                (1/6) * (2 - absu)**3,
+                0.0
+            )
+        )
+
+
+    weights = phi(u)
+    # jax.debug.print("dx= {}, min phi= {}, max phi= {}", 
+    #                 dx, weights.min(), weights.max())
+    weights /= weights.sum(axis=1, keepdims=True)  # normalizza localmente
+
+    return weights  # shape: (H, Nknots)
+def interpolate_controls_spline(knots, H):
+    """
+    knots: (Nsample, Nknots, n, Nu)
+    return: (Nsample, H, n, Nu)
+    """
+    Nsample, Nknots, n, Nu = knots.shape
+    t_knots = jnp.linspace(0, H - 1, Nknots)
+    x_eval = jnp.arange(H)
+    weights = cubic_spline_weights(x_eval, t_knots)  # (H, Nknots)
+
+    # Applica pesi spline a ogni campione
+    def interpolate_single(knots_sample):  # (Nknots, n, Nu)
+        # Applica pesi spline su asse 0
+        # interpolated = jnp.einsum("tk,knu->tnu", weights, knots_sample)
+        interpolated = jnp.sum(weights[:, :, None, None] * knots_sample[None, :, :, :], axis=1)
+
+
+        return interpolated  # (H, n, Nu)
+
+    return jax.vmap(interpolate_single)(knots)  
+
+
+
+def interpolate_controls_spline(knots, H):
+    """
+    knots: (Nsample, Nknots, n, Nu)
+    return: (Nsample, H, n, Nu)
+    """
+    Nsample, Nknots, n, Nu = knots.shape
+    t_knots = jnp.linspace(0, H - 1, Nknots)
+    x_eval = jnp.arange(H)
+    weights = cubic_spline_weights(x_eval, t_knots)  # (H, Nknots)
+
+    # Applica pesi spline a ogni campione
+    def interpolate_single(knots_sample):  # (Nknots, n, Nu)
+        # Applica pesi spline su asse 0
+        # interpolated = jnp.einsum("tk,knu->tnu", weights, knots_sample)
+        interpolated = jnp.sum(weights[:, :, None, None] * knots_sample[None, :, :, :], axis=1)
+
+
+        return interpolated  # (H, n, Nu)
+
+    return jax.vmap(interpolate_single)(knots)  # (Nsample, H, n, Nu)
+def ar1_noise(key, shape, rho=0.3):
     """
     shape: (Nsample, H, n, Nu)
     output: (N, T, n, Nu)
@@ -36,34 +124,7 @@ def ar1_noise(key, shape, rho=0.99999):
 
     eps_full = jnp.concatenate([eps0[:, None], eps_seq], axis=1)  # (N, T, n, Nu)
     return eps_full
-
-def cosine_beta_schedule(T, s=0.008):
-    t = jnp.arange(T + 1, dtype=jnp.float32)
-    f_t = jnp.cos(((t / T + s) / (1 + s)) * jnp.pi / 2) ** 2
-    alphas_bar = f_t / f_t[0]
-    alphas = alphas_bar[1:] / alphas_bar[:-1]
-    betas = 1 - alphas
-    return jnp.clip(betas, 1e-5, 0.999)
-
-def cosine_beta_schedule_scaled(T, beta0, betaT, s=0.008):
-    """
-    Cosine schedule con scaling per rendere beta0 e betaT coerenti con valori desiderati.
-    """
-    t = jnp.arange(T + 1, dtype=jnp.float32)
-    f_t = jnp.cos(((t / T + s) / (1 + s)) * jnp.pi / 2) ** 2
-    alphas_bar = f_t / f_t[0]
-    alphas = alphas_bar[1:] / alphas_bar[:-1]
-    betas = 1 - alphas
-
-    # Riscalamento lineare: beta0_target → beta0, betaT_target → betaT
-    beta_min, beta_max = betas.min(), betas.max()
-    betas_scaled = (betas - beta_min) / (beta_max - beta_min)  # ∈ [0,1]
-    betas_scaled = betas_scaled * (betaT - beta0) + beta0      # ∈ [beta0, betaT]
-
-    return betas_scaled
-
-
-
+# Single-pass reverse diffusion to initialize U
 def run_diffusion_once(args: Args,env, rollout_us, reset_env_jit):
     """
     First phase of D4ORM: initial global reverse diffusion
@@ -76,8 +137,6 @@ def run_diffusion_once(args: Args,env, rollout_us, reset_env_jit):
     Nu = env.action_size
     n = env.num_robots
 
-
-
     rng, rng_reset = jax.random.split(rng)
     state_init = reset_env_jit(rng_reset)
     if args.save_video:
@@ -86,96 +145,86 @@ def run_diffusion_once(args: Args,env, rollout_us, reset_env_jit):
         trajectories_denoised = []
         trajectories_samples = []
 
-    # Diffusion noise schedule
-    betas = jnp.linspace(args.beta0, args.betaT, args.Ndiffuse)
-    # betas = cosine_beta_schedule(args.Ndiffuse)
-    #betas = cosine_beta_schedule_scaled(args.Ndiffuse, args.beta0, args.betaT)
 
+  
+
+    # Diffusion noise schedule
+    betas = jnp.linspace(args.beta0, args.betaT, 500)
+    #betas = exponential_beta_schedule(n_diffusion_steps=100, beta_start=args.beta0, beta_end=args.betaT)
 
     alphas = 1.0 - betas
     alphas_bar = jnp.cumprod(alphas)
     sigmas = jnp.sqrt(1 - alphas_bar)
 
     #  Start from zero control
-    YN = jnp.zeros([args.Hsample, n, Nu])
-    
+    #YN = jnp.zeros([args.Hsample, n, Nu])
+    Nknots = 34
+    YN_knots = jnp.zeros([Nknots, n, Nu])
+
     # Single diffusion step
-    #@jax.jit
+    @jax.jit
     def reverse_once(carry):
-        i, rng, Ybar_i = carry
-        Yi = Ybar_i * jnp.sqrt(alphas_bar[i])
+        i, rng, Ybar_knots_i = carry
+        Yi_knots = Ybar_knots_i * jnp.sqrt(alphas_bar[i])
 
-        # Sample noisy controls
+        # Sample noise at the knot level
         rng, rng_eps = jax.random.split(rng)
-        eps_u = jax.random.normal(rng_eps, (args.Nsample, args.Hsample, n, Nu))
-        #eps_u = ar1_noise(rng_eps, (args.Nsample, args.Hsample, n, Nu), rho=0.9)
-       
-        
+        Nknots = 34 
+        eps_knots = jax.random.normal(rng_eps, (args.Nsample, Nknots, n, Nu))
+        #eps_knots = ar1_noise(rng_eps, (args.Nsample, Nknots, n, Nu), rho=0.3)
 
-        # eps_u_np = np.array(eps_u)
-        # b, a = get_butterworth_coeffs(order=4, fc=2.0, fs=1/env.dt)  # fc personalizzata
-        # eps_u_filt_np = butterworth_filter_numpy(eps_u_np, b, a)
-        # eps_u = jnp.array(eps_u_filt_np)  # torna in JAX
+        Y0s_knots = eps_knots * sigmas[i] + Ybar_knots_i  # shape: (Nsample, Nknots, n, Nu)
 
+        # Interpola ogni sample da knots → full trajectory
+        #Y0s = interpolate_controls(Y0s_knots, args.Hsample)  # (Nsample, H, n, Nu)
+        Y0s = interpolate_controls_spline(Y0s_knots, args.Hsample)
+        Y0s = jnp.clip(Y0s, -1.0, 1.0)
 
-        Y0s = eps_u * sigmas[i] + Ybar_i
-        if env.obstacles_enabled == False:
-            Y0s = jnp.clip(Y0s, -1.0, 1.0)
-        #jax.debug.print("Y0s min: {0:.2f}, max: {1:.2f}", jnp.min(Y0s), jnp.max(Y0s))
         rewss, _ = jax.vmap(rollout_us, in_axes=(None, 0))(state_init, Y0s)
         rews = rewss.mean(axis=(1, 2))
-        # jax.debug.print("→  reward mean: {:.3f}, max: {:.3f}", rews.mean(), rews.max())
 
         rew_std = rews.std()
         rew_std = jnp.where(rew_std < 1e-4, 1.0, rew_std)
         logp0 = (rews - rews.mean()) / rew_std / args.temp_sample
-        # print(f"[Reverse step {i}] reward mean: {rews.mean():.3f}, std: {rews.std():.3f}, max: {rews.max():.3f}, min: {rews.min():.3f}")
-        # print(f"logp0 range: [{logp0.min():.3f}, {logp0.max():.3f}]")
 
-        # if i % 10 == 0:
-        #     # Debug: range dei reward
-        #     print("Reward min/max:", rews.min(), rews.max())
-        #     # Debug: varianza dei sample (quanto i controlli sono diversi tra loro)
-        #     print("Varianza Y0s:", Y0s.var())
-        #     # Debug: media campioni (vedi se collassano a zero)
-        #     print("Mean Y0s:", Y0s.mean())
-        # Weighted average of samples  (Monte carlo estimate)
         weights = jax.nn.softmax(logp0)
-        # print(f"softmax weights max: {weights.max():.3f}, min: {weights.min():.3f}")
+        Ybar_knots = jnp.einsum("s,sqij->qij", weights, Y0s_knots)  # media pesata sui knots
 
-        Ybar = jnp.einsum("s,shij->hij", weights, Y0s)
-        # best = jnp.argmax(logp0)
-        # Ybar = Y0s[best]
         # Reverse diffusion step
-        score = 1 / (1.0 - alphas_bar[i]) * (-Yi + jnp.sqrt(alphas_bar[i]) * Ybar)
-        Yim1 = 1 / jnp.sqrt(alphas[i]) * (Yi + (1.0 - alphas_bar[i]) * score)
-        Ybar_im1 = Yim1 / jnp.sqrt(alphas_bar[i - 1])
-        return (i - 1, rng, Ybar_im1), Yi,Y0s
+        score = 1 / (1.0 - alphas_bar[i]) * (-Yi_knots + jnp.sqrt(alphas_bar[i]) * Ybar_knots)
+        Yi_knots_m1 = 1 / jnp.sqrt(alphas[i]) * (Yi_knots + (1.0 - alphas_bar[i]) * score)
+        Ybar_knots_im1 = Yi_knots_m1 / jnp.sqrt(alphas_bar[i - 1])
 
-    def reverse(YN, rng):
-        Yi = YN
-        for i in reversed(range(1,args.Ndiffuse)):
-            carry = (i, rng, Yi)
-            (i, rng, Yi),Yi_current,Y0s = reverse_once(carry)
-            if args.save_video and i % 10  == 0: 
-                # Salva Yi
-                Yi_list.append(np.array(Yi_current))  # (H, n, Nu)
-                Y0s_list.append(np.array(Y0s))  # (Nsample, H, n, Nu)
+        return (i - 1, rng, Ybar_knots_im1), Yi_knots, Y0s
 
-                # Rollout Yi
-                _, traj_denoised = rollout_us(state_init, Yi_current)
-                trajectories_denoised.append(np.array(traj_denoised[..., :2]))  # (T+1, n, 2)
 
-                # Rollout Y0s
-                _,traj_samples = jax.vmap(rollout_us, in_axes=(None, 0))(state_init, Y0s)
-                trajectories_samples.append(np.array(traj_samples[..., :2]))  # (Nsample, T+1, n, 2)
+    def reverse(YN_knots, rng):
+        Yi_knots = YN_knots
+        for i in reversed(range(1, 500)):
+            carry = (i, rng, Yi_knots)
+            (i, rng, Yi_knots), Yi_knots_current, Y0s = reverse_once(carry)
+
+            if args.save_video and i % 5 == 0:
+                Yi_full = interpolate_controls_spline(Yi_knots_current[None, ...], args.Hsample)[0]
+                Y0s_full = interpolate_controls_spline(Y0s, args.Hsample)
+
+                Yi_list.append(np.array(Yi_full))  # (H, n, Nu)
+                Y0s_list.append(np.array(Y0s_full))  # (Nsample, H, n, Nu)
+
+                _, traj_denoised = rollout_us(state_init, Yi_full)
+                trajectories_denoised.append(np.array(traj_denoised[..., :2]))
+
+                _, traj_samples = jax.vmap(rollout_us, in_axes=(None, 0))(state_init, Y0s_full)
+                trajectories_samples.append(np.array(traj_samples[..., :2]))
         if args.save_video:
-            return Yi, Yi_list, Y0s_list, trajectories_denoised, trajectories_samples
+            final_Yi = interpolate_controls_spline(Yi_knots[None, ...], args.Hsample)[0]
+            return final_Yi, Yi_list, Y0s_list, trajectories_denoised, trajectories_samples
         else:
-            return Yi
+            return interpolate_controls_spline(Yi_knots[None, ...], args.Hsample)[0]
+
     if args.save_video:
         rng_exp, rng = jax.random.split(rng)
-        U_0, Yi_list, Y0s_list, trajectories_denoised, trajectories_samples = reverse(YN, rng_exp)
+        U_0, Yi_list, Y0s_list, trajectories_denoised, trajectories_samples = reverse(YN_knots, rng_exp)
         # Salva tutto
         np.savez("results/multicar_iterative/global_Yi_list.npz", 
                 Yi_list=Yi_list, 
@@ -184,7 +233,7 @@ def run_diffusion_once(args: Args,env, rollout_us, reset_env_jit):
                 trajectories_samples=trajectories_samples)
     else:
         rng_exp, rng = jax.random.split(rng)
-        U_0 = reverse(YN, rng_exp)
+        U_0 = reverse(YN_knots, rng_exp)
     state_init_eval = reset_env_jit(jax.random.PRNGKey(args.seed + 1024))
     rewss_eval, _ = rollout_us(state_init_eval, U_0)
     rews, pipeline_states = rollout_us(state_init_eval, U_0)
@@ -196,12 +245,13 @@ def run_diffusion_once(args: Args,env, rollout_us, reset_env_jit):
     r_terms_all = []  # accumula r_terms: shape (n, 6)
     for t in range(U_0.shape[0]):
         q_t = q_states[t]
-        #u_t = jnp.clip(U_0[t], -1.0, 1.0)
-        u_t = U_0[t]
+        u_t = jnp.clip(U_0[t], -1.0, 1.0)
+        #u_t = U_0[t]
         _, r_terms = env.get_rewards(q_t, u_t)   # shape (n, 6)
         r_terms_all.append(r_terms)
         
     return U_0
+
 
 # Local iterative diffusion optimization
 def run_diffusion_local(args: Args, U_init: jnp.ndarray,env, rollout_us, reset_env_jit):
@@ -251,26 +301,6 @@ def run_diffusion_local(args: Args, U_init: jnp.ndarray,env, rollout_us, reset_e
             U_curr = U_w
             lambda_curr = lambda_goal
             delta_t = 0 
-            U_soft_single = U_full  # shape (L, n, Nu)
-        
-            state_soft = env.reset(jax.random.PRNGKey(args.seed ))
-            rew_soft, pipeline_soft = rollout_us(state_soft, U_soft_single)
-            U_soft_batch = jnp.repeat(U_soft_single[None, ...], args.Nsample, axis=0)  # shape (Nsample, L, n, Nu)
-            state_soft = reset_env_jit(jax.random.PRNGKey(args.seed))
-            #rew_soft, pipeline_soft = jax.vmap(rollout_us, in_axes=(None, 0))(state_soft, U_soft_batch)
-
-            
-            # Usa una nuova lagrangiana con batch size = 1
-            lagrangian_fn_1 = make_lagrangian_fn(state_soft, env, Nsample=1)
-
-            L_soft, _, L_tot_soft, *_ = lagrangian_fn_1(
-                U_soft_single[None, ...], U_soft_single[None, ...], 
-                pipeline_soft[None, ...], pipeline_soft[None, ...], 
-                lambda_curr, args.mu
-            )
-
-            baseline =  L_tot_soft[0] 
-            # print(f"   baseline = {baseline:.4f}")
             for i in range(N_inner):
 
                 rng_w, rng_step = jax.random.split(rng_w)
@@ -297,7 +327,9 @@ def run_diffusion_local(args: Args, U_init: jnp.ndarray,env, rollout_us, reset_e
                 pipeline_states_window = pipeline_states[:, t_start:t_start+L]
 
                 # Compute Lagrangian values for each sample
-                L_cost,L_constraint,L_vals,control_cost,barrier_cost,goal_cost,h_flat,obstacle_cost_global,orient_cost_global,reverse_penalty_global = lagrangian(Y0s,U_fulls, pipeline_states, pipeline_states_window, lambda_curr, args.mu)
+               # L_vals = lagrangian(Y0s, pipeline_states, lambda_curr, args.mu)
+                L_cost,L_constraint,L_vals,control_cost,barrier_cost,goal_cost,h_flat,_,_,_ = lagrangian(Y0s,Y0s, pipeline_states, pipeline_states_window, lambda_curr, args.mu)
+                #L_cost,L_constraint,L_vals,control_cost,barrier_cost,goal_cost,h_flat,obstacle_cost_global,orient_cost_global,reverse_penalty_global = lagrangian(Y0s,U_fulls, pipeline_states, pipeline_states_window, lambda_curr, args.mu)
 
                 # Estimate gradient using score function estimator
                 grad = jnp.einsum("s,slij->lij", L_vals - L_vals.mean(), noise)
@@ -361,14 +393,13 @@ def run_diffusion_local(args: Args, U_init: jnp.ndarray,env, rollout_us, reset_e
                             Y0s = eps_u * sigma_local + U_w
                             if env.obstacles_enabled == False:
                                  Y0s = jnp.clip(Y0s, -1.0, 1.0)
-                            
 
                             # Insert modified window into full control sequences
                             U_fulls = jnp.repeat(U[None, ...], args.Nsample, axis=0)
                             U_fulls = U_fulls.at[:, t_start:t_end, :, :].set(Y0s)
                             #  Evaluate new rollouts
                             state_init = reset_env_jit(rng_step)
-                            rewss, traj_samples = jax.vmap(rollout_us, in_axes=(None, 0))(state_init, U_fulls)
+                            rewss, _ = jax.vmap(rollout_us, in_axes=(None, 0))(state_init, U_fulls)
                             rews = rewss.mean(axis=(1, 2))
 
                             # Compute weighted average of samples
@@ -379,13 +410,6 @@ def run_diffusion_local(args: Args, U_init: jnp.ndarray,env, rollout_us, reset_e
                             # U_opt = Y0s[best]
                             # Final evaluation
                             U_new = jnp.sqrt(alphas_bar_local[j - 1]) * U_opt
-                            # if args.save_video:
-                            #     # Rollout per ottenere (x,y) delle traiettorie campionate
-                            #     _, traj_denoised = rollout_us(state_init, U_new)
-
-                            #     trajectories_samples_local.append(np.array(traj_samples[..., :2]))       # shape: (Nsample, T+1, n, 2)
-                            #     trajectories_denoised_local.append(np.array(traj_denoised[..., :2]))     # shape: (T+1, n, 2)
-
                 
                         return U_new
 
@@ -399,9 +423,6 @@ def run_diffusion_local(args: Args, U_init: jnp.ndarray,env, rollout_us, reset_e
                 rewards_per_iter.append(np.array(reward_per_robot))
                 reward_array_str = "[" + ", ".join(f"{r:.4f}" for r in reward_per_robot) + "]"
                 print(f"[Iteration {k}] robots average rewards: {reward_array_str}")
-    if args.save_video:np.savez("results/multicar_iterative/local_Yi_list.npz", 
-             trajectories_denoised=trajectories_denoised_local, 
-             trajectories_samples=trajectories_samples_local)
 
     return U,rewards_per_iter
 
@@ -562,8 +583,8 @@ def main():
         state = state_init
         r_terms_all_local = jnp.array([jnp.zeros((args.n_robots, 7))])  # shape (1, n, 6)
         for t in range(U_opt.shape[0]):
-            #u_t = jnp.clip(U_opt[t], -1.0, 1.0)
-            u_t = U_opt[t]      
+            u_t = jnp.clip(U_opt[t], -1.0, 1.0)
+            #u_t = U_opt[t]      
             state = step_env_jit(state, U_opt[t])
             xs = jnp.concatenate([xs, state.pipeline_state[None]], axis=0)
             _, r_terms = env.get_rewards(state.pipeline_state, u_t)  # r_terms: (n, 6)

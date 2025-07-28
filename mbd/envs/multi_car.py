@@ -16,16 +16,15 @@ class Args:
     Hsample: int = 100          # horizon
     Ndiffuse: int = 100         # number of diffusion steps
     temp_sample: float = 0.1    # temperature for sampling
-    # per ibrido
-    #beta0: float = 5e-4         # initial noise
-    #betaT: float = 2e-2         # final noise  
-    # PER D4orm e ECD
     beta0: float = 1e-4         # initial noise
-    betaT: float = 1e-2       # final noise  
-    initial_sigma: float = 0.1   # initial gaussian noise # ECD = 1
-    alpha: float = 0.1         # optimization step size
-    mu: float = 50             # penalty term
-    noise_decay: float = 0.3    # decay factor for noise # ECD = 0.3
+    betaT: float = 1e-2         # final noise  
+    # PER D4orm e ECD
+    # beta0: float = 0.05         # initial noise
+    # betaT: float = 0.1       # final noise  
+    initial_sigma: float = 0.02   # initial gaussian noise # ECD = 1
+    alpha: float = 0.01         # optimization step size
+    mu: float = 10             # penalty term
+    noise_decay: float = 0.03    # decay factor for noise # ECD = 0.3
     not_render: bool = False
     high_resolution: bool = False
     ECD : bool = False
@@ -33,6 +32,8 @@ class Args:
     T: int = 30
     save_video: bool = False 
     obstacles_enabled: bool = False  # Attiva penalità da ostacoli se True
+    penalize_backward: bool = False
+
 
 
 def car_dynamics(x, u):
@@ -106,7 +107,7 @@ def circular_shift_goals(n,radius, shift=(0.0, 3.0)):
 
         return x0, xg
         
-def check_collision_static(pos, obstacles, Ra):
+def check_collision_static(pos, obstacles):
     def single_obs_check(obs):
         xc, yc, w, h = obs
         x_min = xc - w / 2
@@ -116,25 +117,10 @@ def check_collision_static(pos, obstacles, Ra):
         dx = jnp.maximum(jnp.maximum(x_min - pos[0], 0), pos[0] - x_max)
         dy = jnp.maximum(jnp.maximum(y_min - pos[1], 0), pos[1] - y_max)
         dist = jnp.sqrt(dx ** 2 + dy ** 2 + 1e-6)
-        return dist < Ra
+        return dist < 0.4
 
     return jnp.any(jax.vmap(single_obs_check)(obstacles))
 
-def compute_r_safe(p, q_all, k, Ra, margin=0.05):
-    """
-    Penalizza le collisioni tra robot con log-barrier.
-    Ritorna 0 se non ci sono collisioni, negativo se ci sono.
-    """
-    others = q_all[:, :2]
-    dists = jnp.linalg.norm(p - others, axis=1)
-    is_other = jnp.arange(q_all.shape[0]) != k
-
-    safe_d =  Ra + margin
-    violation = jnp.clip(safe_d - dists, 0.0, None)  # quanto si viola la distanza minima
-    penalties = -jnp.log1p(violation * 10.0)  # più pesante man mano che ci si avvicina (scalato)
-    penalties = jnp.where(is_other, penalties, 0.0)
-
-    return jnp.sum(penalties)  # somma delle penalità → 0 se tutto ok, negativo se collisioni
 
 
 
@@ -155,7 +141,7 @@ class State:
     done: jnp.ndarray            # optional : goal reached 
 
 class MultiCar2d:
-    def __init__(self, n, radius=2.0, robot_radius=0.1,formation_shift = False,obstacles_enabled=False,ECD=False):
+    def __init__(self, n, radius=2.0, robot_radius=0.1,formation_shift = False,obstacles_enabled=False,ECD=False, penalize_backward=False):
         self.n = n              # number of robots
         self.dt = 0.1           # time step
         self.H = 100            # horizon
@@ -165,6 +151,7 @@ class MultiCar2d:
         self.formation_shift = formation_shift
         self.obstacles_enabled = obstacles_enabled
         self. ECD = ECD
+        self.penalize_backward = penalize_backward
         if obstacles_enabled:
             # self.static_obstacles = jnp.array([
             #     [0.0, 1.5, 0.6, 0.1],
@@ -206,7 +193,8 @@ class MultiCar2d:
         """
         Update the state of the environment based on the action taken by the agent.
         """
-        action = jnp.clip(action, -1.0, 1.0)         
+        action = jnp.clip(action, -1.0, 1.0)  
+        #jax.debug.print("Action taken:{} ", action)       
         q = state.pipeline_state                      
 
         # Compute the next state using Runge-Kutta 4
@@ -253,9 +241,17 @@ class MultiCar2d:
             pT = self.xg[k][:2]
             p0 = self.x0[k][:2] 
             r_goal = 1.0 - jnp.linalg.norm(p - pT) / jnp.linalg.norm(p0 - pT)
-            # dist = jnp.linalg.norm(p - pT)
-            # r_goal = 1.0 / (1.0 + dist**2)
+           
+            theta = q[2]
+            theta_target = self.xg[k][2]
 
+            # Penalità sull'orientazione finale: attivata sempre, ma pesata sulla distanza
+            dist_to_goal = jnp.linalg.norm(p - self.xg[k][:2])
+            orient_error = 1.0 - jnp.cos(theta - theta_target)  # 0 se orientato, ~2 se opposto
+            w_orient = jnp.exp(-10.0 * dist_to_goal)  # peso decrescente con la distanza
+            r_orient_final = - w_orient * orient_error  # penalità negativa
+
+   
             dists = jnp.linalg.norm(p - q_all[:, :2], axis=1)
             r_safe = -1.0 * jnp.any((dists <= 2 * self.Ra + 1e-2) & (jnp.arange(self.n) != k))
 
@@ -291,13 +287,17 @@ class MultiCar2d:
             else:
                 r_obstacles = 0.0
 
+            if self.penalize_backward:
+                v = u_k[1]
+                r_backward = jnp.where(v < -0.05, - jnp.abs(v), 0.0)
+            else:
+                r_backward = 0.0
 
             r_form = -rews_formation(q_all, self.x0) if self.formation_shift else 0.0
-
             r_control =  - jnp.sum(u_k ** 2)  # penalizzazione sul controllo
-            r_total_check = r_goal + self.wt * r_safe + r_form + 0.01 * r_control + r_obstacles
+            r_total_check = r_goal + self.wt * r_safe + r_form + 0.01 * r_control + r_obstacles #+r_backward + self.wt*r_orient_final  
             #jax.debug.print("r_total check: {}, from terms: {}", r_total_check, jnp.array([r_goal, r_safe, r_form, r_control, r_obstacles]))
-            r_terms = jnp.array([r_goal, r_safe, r_form, r_control, r_obstacles, r_total_check])
+            r_terms = jnp.array([r_goal, r_safe, r_form, r_control, r_obstacles,r_backward, r_total_check])
             return r_total_check, r_terms
         
         r_total_all, r_terms_all =   jax.vmap(single_reward, in_axes=(0, 0, 0))(jnp.arange(self.n), q_all, u_all)
@@ -324,7 +324,7 @@ class MultiCar2d:
     
 
     #  Function for visualizing the environment
-    def render(self, ax, X: jnp.ndarray, goals: jnp.ndarray = None):
+    def render(self, ax, X: jnp.ndarray, goals: jnp.ndarray = None,actions: jnp.ndarray = None):
         
         n = X.shape[0]
         cmap = plt.get_cmap('tab20', n)
@@ -351,6 +351,14 @@ class MultiCar2d:
             # Draw the robot orientation
             dx = 0.3 * jnp.cos(theta)
             dy = 0.3 * jnp.sin(theta)
+            if actions is not None:
+                v = actions[i, -1, 1]  # ultima velocità lineare del robot i
+                color_arrow = 'green' if v >= -0.05 else 'red'  # o qualsiasi soglia
+            else:
+                color_arrow = color
+
+            ax.arrow(x, y, dx, dy, head_width=0.1, head_length=0.15, fc=color_arrow, ec=color_arrow)
+
             ax.arrow(x, y, dx, dy, head_width=0.1, head_length=0.15, fc=color, ec=color)
         
         ax.set_aspect('equal', adjustable='box')
@@ -370,3 +378,5 @@ class MultiCar2d:
             ax.add_patch(rect)
 
         ax.legend(loc='center left', bbox_to_anchor=(1, 0.5), fontsize=8)
+
+

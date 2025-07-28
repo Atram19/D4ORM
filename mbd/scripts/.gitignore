@@ -1,3 +1,5 @@
 .venv/
 *.mp4
+*.pdf
 __pycache__/
+.venv_manip/
