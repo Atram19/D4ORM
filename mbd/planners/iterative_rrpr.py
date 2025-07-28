@@ -6,7 +6,7 @@ import time
 import os
 import matplotlib.pyplot as plt
 import tyro
-
+import jax.debug
 from mbd.envs.class_manipulator import RRPRSingleEnv, Args, rollout_single_us, forward_kinematics_rrpr_jax
 
 def run_diffusion_once(args: Args, env, rollout_us, reset_env_jit):
@@ -24,9 +24,11 @@ def run_diffusion_once(args: Args, env, rollout_us, reset_env_jit):
     alphas_bar = jnp.cumprod(alphas)
     sigmas = jnp.sqrt(1 - alphas_bar)
 
+    Y0s_list = []
+    states_xyz_all = [] 
     YN = jnp.zeros([args.Hsample, Nu])
 
-    @jax.jit
+    #@jax.jit
     def reverse_once(carry):
         i, rng, Ybar_i = carry
         Yi = Ybar_i * jnp.sqrt(alphas_bar[i])
@@ -34,24 +36,30 @@ def run_diffusion_once(args: Args, env, rollout_us, reset_env_jit):
         rng, rng_eps = jax.random.split(rng)
         eps_u = jax.random.normal(rng_eps, (args.Nsample, args.Hsample, Nu))
         Y0s = eps_u * sigmas[i] + Ybar_i
+        Y0s = jnp.clip(Y0s,-1,1)
+        Y0s_list.append(np.array(Y0s))
 
+        # == Calcola e salva le traiettorie xyz per i primi Nplot sample a questo step ==
+        Nplot = 10 
         rewss, pipeline_state, r_terms = jax.vmap(rollout_us)(Y0s)
+        pipeline_plot = pipeline_state[:Nplot]
+        states_xyz_all.append(np.array(pipeline_plot))
         rews = rewss.mean(axis=-1)
 
         rew_std = rews.std()
         rew_std = jnp.where(rew_std < 1e-4, 1.0, rew_std)
 
-        final_ee = pipeline_state[:, -1, :4]
-        T_final, *_ = jax.vmap(lambda q: forward_kinematics_rrpr_jax(
-            q, env.L1_num, env.L2_num, env.L3_num, env.L4_num, env.D2_num))(final_ee)
-        ee_final_pos = T_final[:, :3, 3]
+        # final_ee = pipeline_state[:, -1, :4]
+        # T_final, *_ = jax.vmap(lambda q: forward_kinematics_rrpr_jax(
+        #     q, env.L1_num, env.L2_num, env.L3_num, env.L4_num, env.D2_num))(final_ee)
+        # ee_final_pos = T_final[:, :3, 3]
 
-        T_goal, *_ = forward_kinematics_rrpr_jax(env.qf, env.L1_num, env.L2_num,
-                                                 env.L3_num, env.L4_num, env.D2_num)
-        goal_pos = T_goal[:3, 3]
+        # T_goal, *_ = forward_kinematics_rrpr_jax(env.qf, env.L1_num, env.L2_num,
+        #                                          env.L3_num, env.L4_num, env.D2_num)
+        # goal_pos = T_goal[:3, 3]
 
-        dist = jnp.linalg.norm(ee_final_pos - goal_pos[None, :], axis=-1)
-        penalty = 10.0 * dist
+        # dist = jnp.linalg.norm(ee_final_pos - goal_pos[None, :], axis=-1)
+        # penalty = 10.0 * dist
 
         logp0 = (rews - rews.mean()) / rew_std / args.temp_sample
         # logp0 -= penalty  # opzionale: penalizzare distanza da goal
@@ -62,31 +70,37 @@ def run_diffusion_once(args: Args, env, rollout_us, reset_env_jit):
         score = 1 / (1.0 - alphas_bar[i]) * (-Yi + jnp.sqrt(alphas_bar[i]) * Ybar)
         Yim1 = 1 / jnp.sqrt(alphas[i]) * (Yi + (1.0 - alphas_bar[i]) * score)
         Ybar_im1 = Yim1 / jnp.sqrt(alphas_bar[i - 1])
+        
+        jax.debug.print("Step {}: mean reward = {:.4f}, std = {:.4f}", i, rews.mean(), rew_std)
 
         return (i - 1, rng, Ybar_im1), Yi, Y0s
-
+  
     def reverse(YN, rng):
         Yi = YN
         for i in reversed(range(1, args.Ndiffuse)):
             carry = (i, rng, Yi)
             (i, rng, Yi), Yi_current, Y0s = reverse_once(carry)
+        np.savez("results/rrpr_states_over_steps.npz", states=np.array(states_xyz_all))
         return Yi
+ 
+
 
     rng_exp, rng = jax.random.split(rng)
     U_0 = reverse(YN, rng_exp)
+   
     return U_0
 
 def main():
     args = tyro.cli(Args)
 
     print("STEP 1: Initial Reverse Diffusion")
-    env = RRPRSingleEnv()
+    env = RRPRSingleEnv(dt = 0.01)
 
     step_env_jit = jax.jit(env.step)
     reset_env_jit = jax.jit(env.reset)
     state_init = reset_env_jit(jax.random.PRNGKey(args.seed))
 
-    rollout_us_fn = partial(rollout_single_us, step_env_jit, state_init)
+    rollout_us_fn = jax.jit(partial(rollout_single_us, step_env_jit, state_init))
 
     t1 = time.time()
     U_init = run_diffusion_once(args, env, rollout_us_fn, reset_env_jit)
@@ -94,7 +108,7 @@ def main():
     print(f"Initial reverse diffusion time: {t2 - t1:.3f} s")
 
     rewards, x_traj, r_terms = rollout_us_fn(U_init)
-    path = "results/rrpr_manipolator"
+    path = "results/manipulator"
     os.makedirs(path, exist_ok=True)
 
     state = reset_env_jit(jax.random.PRNGKey(args.seed))

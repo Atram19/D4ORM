@@ -4,43 +4,59 @@ from jax import jit
 from dataclasses import dataclass
 from functools import partial
 from flax import struct
-from mbd.envs.manipolator import forward_kinematics_RRPR,dh_transform
+import mbd
+from mbd.envs.manipulator import forward_kinematics_RRPR
 # Importa qui le funzioni lambdificate da SymPy (generate separatamente)
 # esempio placeholder, devi definire e importare queste funzioni
-from mbd.envs.manipolator import B_func_jax, C_func_jax, G_func_jax
-
+from mbd.envs.manipulator import B_func_jax, C_func_jax, G_func_jax
 import matplotlib.pyplot as plt
+import os
 import numpy as np
 from matplotlib.animation import FuncAnimation
 from matplotlib import cm
 from jax import debug
+import matplotlib
+import tkinter as tk
+import tyro
+
+os.makedirs("results/manipulator", exist_ok=True)
+
+matplotlib.use('TkAgg')
 # Parametri fissi del robot
 from brax.io import html
-
+def dh_matrix(theta, d, a, alpha):
+    ct, st = jnp.cos(theta), jnp.sin(theta)
+    ca, sa = jnp.cos(alpha), jnp.sin(alpha)
+    return jnp.array([
+        [ct, -st * ca, st * sa, a * ct],
+        [st, ct * ca, -ct * sa, a * st],
+        [0.0, sa, ca, d],
+        [0.0, 0.0, 0.0, 1.0]
+    ])
 
 jax.config.update("jax_debug_nans", True)
 @dataclass
 class Args:
     seed: int = 42
-    Nsample: int = 2048
+    Nsample: int = 1024
     Hsample: int = 100
     Ndiffuse: int = 100
-    beta0: float = 1e-4
-    betaT: float = 1e-3
-    temp_sample: float = 0.2
+    beta0: float = 1e-5         # initial noise
+    betaT: float = 1e-1         # final noise  
+    temp_sample: float = 0.5
     save_video: bool = False
 
-
+@partial(jax.jit, static_argnums=(1)) 
 def get_joint_positions(q, param):
     theta1, theta2, d3, theta4 = q
     a1, a2, a3, a4 = param[:, 0]
     alpha1, alpha2, alpha3, alpha4 = param[:, 1]
     d1, d2, _, d4 = param[:, 2]
 
-    T01 = dh_transform(theta1, d1, a1, alpha1)
-    T12 = dh_transform(theta2, d2, a2, alpha2)
-    T23 = dh_transform(0, d3, a3, alpha3)
-    T34 = dh_transform(theta4, d4, a4, alpha4)
+    T01 = dh_matrix(theta1, d1, a1, alpha1)
+    T12 = dh_matrix(theta2, d2, a2, alpha2)
+    T23 = dh_matrix(0, d3, a3, alpha3)
+    T34 = dh_matrix(theta4, d4, a4, alpha4)
 
     points = [np.zeros(3)]  # punto base
     T = np.eye(4)
@@ -53,16 +69,7 @@ def get_joint_positions(q, param):
     return np.stack(points, axis=0)  # shape (5, 3)
 
 
-def dh_matrix(theta, d, a, alpha):
-    ct, st = jnp.cos(theta), jnp.sin(theta)
-    ca, sa = jnp.cos(alpha), jnp.sin(alpha)
-    return jnp.array([
-        [ct, -st * ca, st * sa, a * ct],
-        [st, ct * ca, -ct * sa, a * st],
-        [0.0, sa, ca, d],
-        [0.0, 0.0, 0.0, 1.0]
-    ])
-
+@partial(jax.jit, static_argnums=(1,2,3,4,5))  # L1–D2 sono costanti
 def forward_kinematics_rrpr_jax(q, L1, L2,L3,L4, D2):
     """
     q = [theta1, theta2, d3, theta4]
@@ -126,21 +133,45 @@ def rk4(dynamics, x, u, dt):
 def euler(dynamics, x, u, dt):
     return x + dt * dynamics(x, u)
 
+@jax.jit
+def B_func_jitted(q, m, L1, L2, L3, L4, D2):
+    return B_func_jax(q, m, L1, L2, L3, L4, D2)
+
+@jax.jit
+def C_func_jitted(q, dq, m, L1, L2, L3, L4, D2):
+    return C_func_jax(q, dq, m, L1, L2, L3, L4, D2)
+
+@jax.jit
+def G_func_jitted(q, m, g, L1, L2, L3, L4):
+    return G_func_jax(q, m, g, L1, L2, L3, L4)
 
 class RRPRSingleEnv:
-    def __init__(self, dt=0.01):
+    def __init__(self, dt=0.001):
         self.dt = dt
         self.H = 100
-        self.ACTION_SCALE = jnp.array([8.0, 8.0, 600.0, 2])
+        self.ACTION_SCALE = jnp.array([175, 50, 75, 2])
 
         self.q0 = jnp.hstack([jnp.array([0.1, 0.1, 0.1, 0.1]), jnp.zeros(4)])
         self.qf = jnp.hstack([jnp.array ([-0.8,0.8,0.03,0.8]),jnp.zeros(4)])# stato iniziale (posizioni + velocità)
-        self.m_num = jnp.array([10., 5., 10., 2.])
-        self.L1_num = 0.10
-        self.L2_num = 0.05
-        self.L3_num = 0.0
-        self.D2_num = 0.02
+        # self.m_num = jnp.array([10., 5., 10., 2.])
+        # self.L1_num = 0.10
+        # self.L2_num = 0.05
+        # self.L3_num = 0.0
+        # self.D2_num = 0.02
+        # self.L4_num = self.D2_num
+        self.L1_num = 0.40  # 40 cm → braccio principale
+        self.L2_num = 0.30  # 30 cm → secondo braccio
+        self.L3_num = 0.0   # prismatico
+        self.D2_num = 0.10  # altezza (o offset) finale in z
         self.L4_num = self.D2_num
+
+        self.m_num = jnp.array([
+            6.0,   # m1: link lungo L1 (più robusto)
+            4.0,   # m2: link lungo L2
+            1.0,   # m3: prismatico (massa limitata)
+            0.8    # m4: end-effector o giunto finale
+        ])
+
         self.g0_num = jnp.array([0., 0., -9.81])
         # Parametri DH simbolici
         self.a = jnp.array([self.L1_num, self.L2_num, self.L3_num, self.L4_num])
@@ -159,112 +190,87 @@ class RRPRSingleEnv:
         
 
         #D = jnp.diag(jnp.array([0,0,0, 10.0]))  # damping più forte
-        B = B_func_jax(q, self.m_num,self.L1_num, self.L2_num,self.L3_num,self.L4_num, self.D2_num)
-        C = C_func_jax(q, dq, self.m_num, self.L1_num, self.L2_num,self.L3_num,self.L4_num,self.D2_num)
-        G = G_func_jax(q, self.m_num, self.g0_num,self.L1_num,self.L2_num,self.L3_num,self.L4_num)
+        # B = B_func_jax(q, self.m_num,self.L1_num, self.L2_num,self.L3_num,self.L4_num, self.D2_num)
+        # C = C_func_jax(q, dq, self.m_num, self.L1_num, self.L2_num,self.L3_num,self.L4_num,self.D2_num)
+        # G = G_func_jax(q, self.m_num, self.g0_num,self.L1_num,self.L2_num,self.L3_num,self.L4_num)
+        B = B_func_jitted(q, self.m_num, self.L1_num, self.L2_num, self.L3_num, self.L4_num, self.D2_num)
+        C = C_func_jitted(q, dq, self.m_num, self.L1_num, self.L2_num, self.L3_num, self.L4_num, self.D2_num)
+        G = G_func_jitted(q, self.m_num, self.g0_num, self.L1_num, self.L2_num, self.L3_num, self.L4_num)
+
         G = G.squeeze()
 
         ddq = jnp.linalg.solve(B, u - C @ dq - G )
         s = jnp.linalg.svd(B, compute_uv=False)
         cond =s[0]/s[-1]
-        debug.print("B = {}", B)
-        debug.print("C @ dq = {}", C @ dq)
-        debug.print("G = {}", G)
-        debug.print("ddq = {}", ddq)
+        #debug.print("B = {}", B)
+        #debug.print("cond(B) = {}", cond)
+        # debug.print("C @ dq = {}", C @ dq)
+        # debug.print("G = {}", G)
+        # debug.print("ddq = {}", ddq)
 
         return jnp.concatenate([dq, ddq])
 
     @partial(jax.jit, static_argnums=(0,))
     def reset(self,rng):
-        return State(pipeline_state=self.q0, reward=0.0, r_terms=jnp.zeros(6))
+        return State(pipeline_state=self.q0, reward=0.0, r_terms=jnp.zeros(5))
 
     @partial(jax.jit, static_argnums=(0,))
     def step(self, state: State, action: jax.Array) -> State:
-        #action = jnp.clip(action, -1.0, 1.0)
-        #action_scaled = action * self.ACTION_SCALE
-        q_new = rk4(self.rrpr_dynamics, state.pipeline_state, action, self.dt)
+        action = jnp.clip(action, -1.0, 1.0)
+        action_scaled = action * self.ACTION_SCALE
+        q_new = rk4(self.rrpr_dynamics, state.pipeline_state, action_scaled, self.dt)
     #    # Clipping sicuro dopo integrazione
         #q_new = q_new.at[:4].set(jnp.clip(q_new[:4], self.q_min, self.q_max))
 
 
         # Clamping solo sulle posizioni (prime 4 variabili)
         #q_new = euler(rrpr_dynamics, state.pipeline_state, action_scaled, self.dt)
-        reward, r_terms = self.get_rewards(q_new, action)
+        reward, r_terms = self.get_rewards(q_new, action_scaled)
         return State(pipeline_state=q_new, reward=reward,r_terms = r_terms)
 
     @partial(jax.jit, static_argnums=(0,))
     def get_rewards(self, q, u):
         pos = q[:4]
         vel = q[4:]
-        #pos = jnp.clip(pos, self.q_min, self.q_max)
 
-        # --- 1. Errore rispetto al goal (in q-space)
-        angle_errors_1 = angle_diff(pos[0], self.qf[0])
-        angle_errors_2 = angle_diff(pos[1], self.qf[1])
-        angle_errors_3 = angle_diff(pos[ 3], self.qf[3])
-        linear_error = pos[2] - self.qf[2]
-        r_q_goal = -1*(angle_errors_1**2+ linear_error**2+angle_errors_2**2+angle_errors_3**2)
-        r_q4 = -100.0 * angle_diff(pos[3], self.qf[3])**2
+        # === 1. Errore rispetto al goal in joint space
+        angle_errors_1 = angle_diff(pos[0],self.qf[0])
+        angle_errors_2 = angle_diff( pos[1],self.qf[1])
+        angle_errors_3 = angle_diff( pos[3],self.qf[3])
+        linear_error = self.qf[2] - pos[2]
+        r_q_goal = -1.0 * (angle_errors_1**2 + angle_errors_2**2 + linear_error**2 + angle_errors_3**2)
 
-         # --- 12 Errore rispetto alle velocita desiderate (in q-space)
-        err_vel_1 = vel[0]- self.qf[4]
-        err_vel_2= vel[1]- self.qf[5]
-        err_vel_3 = vel[2]- self.qf[6]
-        err_vel_4 = vel[3] - self.qf[7]
-        #r_vel = -1*(err_vel_1**2+ err_vel_2**2+err_vel_3**2+100*err_vel_4**2)
-
-        # --- 2. Errore end-effector (in workspace)
-        T_curr,T01, T12, T23, T34 = forward_kinematics_rrpr_jax(pos, self.L1_num, self.L2_num,self.L3_num,self.L4_num, self.D2_num)
+        # === 2. Errore dell’end-effector (in workspace)
+        T_curr, *_ = forward_kinematics_rrpr_jax(pos, self.L1_num, self.L2_num, self.L3_num, self.L4_num, self.D2_num)
         ee_pos = T_curr[:3, 3]
 
-        T_goal,T01, T12, T23, T34 = forward_kinematics_rrpr_jax(self.qf[:4], self.L1_num, self.L2_num, self.L3_num,self.L4_num,self.D2_num)
+        T_goal, *_ = forward_kinematics_rrpr_jax(self.qf[:4], self.L1_num, self.L2_num, self.L3_num, self.L4_num, self.D2_num)
         ee_goal = T_goal[:3, 3]
 
-        # Errori separati
-        err_x = ee_pos[0] - ee_goal[0]
+        err = jnp.linalg.norm( ee_pos-ee_goal)
+        r_goal = -10.0 * err**2
 
-        err_y = ee_pos[1] - ee_goal[1]
-        err_z = ee_pos[2] - ee_goal[2]
-        err = jnp.linalg.norm(ee_pos - ee_goal)
-        # Penalizzazione quadratica, pesata
-        r_goal = -100*( err_x**2 +  err_y**2 + 20.0 * err_z**2)  # z più importante
+        # === 3. Penalità sul controllo (solo vicino al goal)
+        r_control =  -0.001 * jnp.sum(abs(u)**2)
 
+        # === 4. Penalità sulla velocità
+        r_vel = -0.001 * jnp.sum(abs(vel)**2)
 
-
-        # --- 3. Penalità sull’azione (control effort)
-        # Penalizza control effort solo se sei vicino al goal
-        r_control = jnp.where(err < 0.05, -0.1 * jnp.sum(u**2), 0.0)
-
-        # --- 4. Penalità sulla velocità
-        #r_vel = - jnp.mean(vel[3]**2)
-        # Penalizza velocità solo se sei vicino al goal
-        r_vel = jnp.where( err< 0.05, -5.0 * jnp.sum(vel**2), 0.0)
-        # # --- 5. Penalità su posizioni fuori dai limiti (soft barrier)
-        eps = 1e-4
-        q_upper_margin = jnp.clip(self.q_max - pos, a_min=eps, a_max=10.0)
-        q_lower_margin = jnp.maximum(pos - self.q_min, eps)
-        r_safe = -10.0 * (jnp.sum(jnp.log(q_upper_margin)) + jnp.sum(jnp.log(q_lower_margin)))
-
-        dq_max = jnp.array([5.0, 5.0, 2.0, 3.0])
-        dq_upper_margin = jnp.maximum(dq_max - vel, eps)
-        dq_lower_margin = jnp.maximum(vel + dq_max, eps)  # simmetrico (±dq_max)
-
-        r_dq_safe = -5.0 * (jnp.sum(jnp.log(dq_upper_margin)) + jnp.sum(jnp.log(dq_lower_margin)))
-
-        # --- 6. Reward finale (pesato)
+        # === 5. Penalità soft-barrier sui limiti dei giunti e velocità
+        
+        # === 6. Reward totale pesato
         r_total = (
             + 5.0 * r_q_goal
-            + 5.0 * r_goal
-            + 0.001 * r_control
-            + 0.01 * r_vel
-            # + 1.0 * r_safe         # log-barrier su posizioni
-            # +2*r_dq_safe
+            + 10.0 * r_goal
+            + 1.0 * r_control
+            + 1.0 * r_vel
+           
         )
 
-        r_terms = jnp.array([r_goal, r_q_goal, r_control, r_vel, r_safe, r_total])
-
+        r_terms = jnp.array([r_goal, r_q_goal, r_control, r_vel, r_total])
         return r_total, r_terms
 
+      
 
     # size of the action space
     @property
@@ -291,7 +297,52 @@ class RRPRSingleEnv:
         dq_seq = X[:, 4:]
 
         T = len(X)
+        import os
+        os.makedirs("results/manipulator_diffusion", exist_ok=True)
 
+        plt.figure(figsize=(12,6))
+        for i in range(4):
+            plt.plot(q_seq[:,i], label=f'pos q{i+1}')
+        plt.title('Evoluzione delle posizioni dei giunti')
+        plt.xlabel('Step')
+        plt.ylabel('Posizione')
+        plt.legend()
+        plt.grid(True)
+        plt.savefig("results/manipulator_diffusion/posizioni_giunti.png")
+        plt.close()
+
+        plt.figure(figsize=(12,6))
+        for i in range(4):
+            plt.plot(dq_seq[:,i], label=f'vel dq{i+1}')
+        plt.title('Evoluzione delle velocità dei giunti')
+        plt.xlabel('Step')
+        plt.ylabel('Velocità')
+        plt.legend()
+        plt.grid(True)
+        plt.savefig("results/manipulator_diffusion/velocita_giunti.png")
+        plt.close()
+
+        plt.figure(figsize=(12,6))
+        for i in range(4):
+            plt.plot(tau_seq[:,i], label=f'tau{i+1}')
+        plt.title('Evoluzione delle azioni')
+        plt.xlabel('Step')
+        plt.ylabel('Tau')
+        plt.legend()
+        plt.grid(True)
+        plt.savefig("results/manipulator_diffusion/azioni.png")
+        plt.close()
+
+        plt.figure(figsize=(8,4))
+        plt.plot(rewards)
+        plt.title('Reward ad ogni step')
+        plt.xlabel('Step')
+        plt.ylabel('Reward')
+        plt.grid(True)
+        plt.savefig("results/manipulator_diffusion/reward.png")
+        plt.close()
+
+       
         fig = plt.figure(figsize=(14, 12))
         ax3d = fig.add_subplot(3, 2, 1, projection='3d')
         ax_q = fig.add_subplot(3, 2, 2)
@@ -303,8 +354,8 @@ class RRPRSingleEnv:
 
         fig2 = plt.figure()
         # 3D settings
-        ax3d.set_xlim([-0.2, 0.2])
-        ax3d.set_ylim([-0.2, 0.2])
+        ax3d.set_xlim([-0.8, 0.8])
+        ax3d.set_ylim([-0.8, 0.8])
         ax3d.set_zlim([-0.5, 0.3])
         ax3d.set_xlabel('x'); ax3d.set_ylabel('y'); ax3d.set_zlabel('z')
         ax3d.view_init(elev=45, azim=45)
@@ -343,8 +394,8 @@ class RRPRSingleEnv:
         if r_terms is not None:
             fig_terms = plt.figure(figsize=(10, 6))
             ax_terms = fig_terms.add_subplot(1, 1, 1)
-            labels = ["r_goal", "r_q_goal", "r_control", "r_vel", "r_safe", "r_total"]
-            for i in range(min(r_terms.shape[1], 6)):
+            labels = ["r_goal", "r_q_goal", "r_control", "r_vel", "r_total"] 
+            for i in range(min(r_terms.shape[1], 5)):
                 ax_terms.plot(r_terms[:, i], label=labels[i])
             ax_terms.set_title("Andamento dei singoli termini di reward")
             ax_terms.set_xlabel("Step")
@@ -385,7 +436,7 @@ class RRPRSingleEnv:
             ee_pos = np.array(p4)
 
             # Goal position (end-effector)
-            T_goal = forward_kinematics_rrpr_jax(qf, self.L1_num, self.L2_num,self.L3_num,self.L4_num, self.D2_num)
+            T_goal,*_ = forward_kinematics_rrpr_jax(qf, self.L1_num, self.L2_num,self.L3_num,self.L4_num, self.D2_num)
             ee_goal = np.array(T_goal[:3, 3])
             e = ee_pos-ee_goal
             # Aggiorna linea robotica
@@ -427,8 +478,7 @@ class RRPRSingleEnv:
             ax_e.relim()
             ax_e.autoscale_view()
 
-            if frame == T - 1:
-                fig.savefig("last_frame.png", dpi=300)
+            
 
             return (
                 robot_line, trail_line, title3d, goal_point,
@@ -439,7 +489,8 @@ class RRPRSingleEnv:
        
 
         ani = FuncAnimation(fig, update, frames=T, interval=50)
-        ani.save("motion_extended.mp4", writer='ffmpeg', fps=20)
+        ani.save("results/manipulator_diffusion/motion_extended.mp4", writer='ffmpeg', fps=20)
+
         plt.tight_layout()
         plt.show()
 
@@ -466,7 +517,7 @@ def compute_potential_energy(q,self):
     V = self.m_num[0]*g*z1 + self.m_num[1]*g*z2 + self.m_num[2]*g*z3 + self.m_num[3]*g*z4
     return V
 
-def compute_mechanical_energy(q, dq):
+def compute_mechanical_energy(q, dq,self):
     T = compute_kinetic_energy(q, dq,env)
     V = compute_potential_energy(q,env)
     E = T+V
@@ -488,10 +539,10 @@ def simple_controller(state, qf,self):
 
     # Errore CAMBIARE ORDINEEEEEE
     e = jnp.array([
-        angle_diff(q[0], qf[0]),   # rotazionale
-        angle_diff(q[1], qf[1]),   # rotazionale
-        q[2] - qf[2],              # PRISMATICO ← normale differenza
-        angle_diff(q[3], qf[3])    # rotazionale
+        angle_diff(qf[0],q[0]),   # rotazionale
+        angle_diff( qf[1],q[1]),   # rotazionale
+        qf[2]-q[2] ,              # PRISMATICO ← normale differenza
+        angle_diff( qf[3],q[3])    # rotazionale
     ])
 
     de = -dq
@@ -512,8 +563,18 @@ def simple_controller(state, qf,self):
 
 
 if __name__ == "__main__":
-    env = RRPRSingleEnv()
-    state = env.reset(jax.random.PRNGKey(0))  # Inizializza lo stato
+
+    args = tyro.cli(Args)
+    env = RRPRSingleEnv(dt= 0.01)
+    step_env_jit = jax.jit(env.step)
+    reset_env_jit = jax.jit(env.reset)
+    state_init = reset_env_jit(jax.random.PRNGKey(args.seed))
+    
+    state = reset_env_jit(jax.random.PRNGKey(0))  # Inizializza lo stato
+
+    
+
+    rollout_us_fn = partial(rollout_single_us, step_env_jit, state_init)
 
     positions = []
     velocities = []
@@ -521,13 +582,16 @@ if __name__ == "__main__":
     distances_per_joint = []
     actions=[]
     error =[]
+
+
     for i in range(env.H):
         action = simple_controller(state.pipeline_state, env.qf,env)  # nessuna coppia applicata
         print(f"Step {i} — torque τ = {action}")
         print(f"‣ max |τ| = {np.max(np.abs(action)):.2f}")
 
        
-        state = env.step(state, action)
+        state = state = step_env_jit(state, action)
+
         q = np.array(state.pipeline_state[:4])  # stato attuale
         dq = np.array(state.pipeline_state[4:])  # velocità
         # Errore rispetto al goal
@@ -553,8 +617,8 @@ if __name__ == "__main__":
     
     fig = plt.figure()
     ax = fig.add_subplot(111, projection='3d')
-    ax.set_xlim([-0.2, 0.2])
-    ax.set_ylim([-0.2, 0.2])
+    ax.set_xlim([-0.8, 0.8])
+    ax.set_ylim([-0.8, 0.8])
     ax.set_zlim([-0.5, 0.3])
     ax.set_xlabel('x'); ax.set_ylabel('y'); ax.set_zlabel('z')
     ax.view_init(elev=45, azim=45)
@@ -566,6 +630,59 @@ if __name__ == "__main__":
 
     trail_x, trail_y, trail_z = [], [], []
     goal_point, = ax.plot([], [], [], 'go', markersize=8, label='Goal')
+    # Plot posizioni
+    plt.figure(figsize=(12,6))
+    for i in range(4):
+        plt.plot(positions[:,i], label=f'pos q{i+1}')
+    plt.title('Evoluzione delle posizioni dei giunti')
+    plt.xlabel('Step')
+    plt.ylabel('Posizione')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig("results/manipulator/posizioni_giunti.png")
+    plt.show()
+    plt.figure(figsize=(12,6))
+    for i in range(4):
+        plt.plot(actions[:,i], label=f'pos q{i+1}')
+    plt.title('Evoluzione delle azioni ')
+    plt.xlabel('Step')
+    plt.ylabel('azioni')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig("results/manipulator/azioni.png")
+    plt.show()
+    # Plot velocità
+    plt.figure(figsize=(12,6))
+    for i in range(4):
+        plt.plot(velocities[:,i], label=f'vel dq{i+1}')
+    plt.title('Evoluzione delle velocità dei giunti')
+    plt.xlabel('Step')
+    plt.ylabel('Velocità')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig("results/manipulator/velocita_giunti.png")
+    plt.show()
+
+    # Plot reward
+    plt.figure(figsize=(8,4))
+    plt.plot(rewards)
+    plt.title('Reward ad ogni step')
+    plt.xlabel('Step')
+    plt.ylabel('Reward')
+    plt.grid(True)
+    plt.savefig("results/manipulator/reward.png")
+    plt.show()
+    
+    plt.figure(figsize=(12,6))
+    for i in range(4):
+        plt.plot(errors[:,i], label=f' e{i+1}')
+    plt.title('errore per giunto')
+    plt.xlabel('Step')
+    plt.ylabel('errori')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig("results/manipulator/errore_giunti.png")
+    plt.show()
 
     def update(frame):
         qf = np.array(env.qf[:4])  # stato finale
@@ -607,5 +724,98 @@ if __name__ == "__main__":
         return robot_line, trail_line, title,goal_point
 
     ani = FuncAnimation(fig, update, frames=len(positions), interval=50, blit=False)
-    plt.show()
-    #ani.save("manipulator_motion.mp4", writer='ffmpeg', fps=20)
+    #plt.show()
+      
+    ani.save("results/manipulator/manipulator_motion.mp4", writer='ffmpeg', fps=20)
+
+
+
+
+# if __name__ == "__main__":
+#     env = RRPRSingleEnv()
+#     state = env.reset(jax.random.PRNGKey(0))
+
+#     T = 150  # numero di step
+#     energy_total = []
+#     energy_kin = []
+#     energy_pot = []
+#     positions = []
+#     velocities = []
+#     for i in range(T):
+#         q = state.pipeline_state[:4]
+#         dq = state.pipeline_state[4:]
+#         E, T_kin, V_pot = compute_mechanical_energy(q, dq,env)
+#         energy_total.append(E)
+#         energy_kin.append(T_kin)
+#         energy_pot.append(V_pot)
+#         positions.append(np.array(q))
+#         velocities.append(np.array(dq))
+#         # Nessuna azione applicata
+#         action = jnp.zeros(4)
+#         state = env.step(state, action)
+
+#     energy_total = np.array(energy_total)
+#     energy_kin = np.array(energy_kin)
+#     energy_pot = np.array(energy_pot)
+#     positions = np.array(positions)
+
+#     import matplotlib.pyplot as plt
+#     plt.figure(figsize=(10, 6))
+#     plt.plot(energy_total, label='Energia Totale')
+#     plt.plot(energy_kin, label='Energia Cinetica')
+#     plt.plot(energy_pot, label='Energia Potenziale')
+#     plt.xlabel('Step')
+#     plt.ylabel('Energia [J]')
+#     plt.title('Verifica conservazione energia (azioni nulle)')
+#     plt.legend()
+#     plt.grid(True)
+#     plt.tight_layout()
+#     plt.savefig("results/manipulator/energia_conservata.png")
+
+#     plt.show()
+
+#     print(f"ΔE_max = {np.max(energy_total) - np.min(energy_total):.6f} J")
+
+#     # === Animazione robot ===
+#     fig = plt.figure()
+#     ax = fig.add_subplot(111, projection='3d')
+#     ax.set_xlim([-0.8, 0.8])
+#     ax.set_ylim([-0.8, 0.8])
+#     ax.set_zlim([-0.8, 0.8])
+#     ax.set_xlabel("x"); ax.set_ylabel("y"); ax.set_zlabel("z")
+#     ax.view_init(elev=45, azim=45)
+
+#     robot_line, = ax.plot([], [], [], 'ko-', lw=2)
+#     trail_line, = ax.plot([], [], [], 'r--', lw=1)
+#     title = ax.text2D(0.05, 0.95, "", transform=ax.transAxes)
+
+#     trail_x, trail_y, trail_z = [], [], []
+
+#     def update(frame):
+#         q = positions[frame]
+#         param = np.array(env.param)
+#         param[2, 2] = q[2]  # imposta d3 prismatico
+#         points = get_joint_positions(q, param)  # (5, 3)
+
+#         robot_line.set_data(points[:, 0], points[:, 1])
+#         robot_line.set_3d_properties(points[:, 2])
+
+#         trail_x.append(points[-1, 0])
+#         trail_y.append(points[-1, 1])
+#         trail_z.append(points[-1, 2])
+#         trail_line.set_data(trail_x, trail_y)
+#         trail_line.set_3d_properties(trail_z)
+
+#         title.set_text(f"Step {frame}")
+#         return robot_line, trail_line, title
+
+#     ani = FuncAnimation(fig, update, frames=T, interval=30, blit=False)
+#     os.makedirs("results/manipulator", exist_ok=True)
+
+#     ani.save("results/manipulator/energia_robot.mp4", writer='ffmpeg', fps=30)
+
+#     plt.show()
+
+
+  
+

@@ -2,6 +2,7 @@ LICENSE
 README.md
 setup.py
 mbd/__init__.py
+mbd/butterworth.py
 mbd/utils.py
 mbd.egg-info/PKG-INFO
 mbd.egg-info/SOURCES.txt

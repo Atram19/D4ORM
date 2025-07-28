@@ -2,13 +2,13 @@ import numpy as np
 import matplotlib.pyplot as plt
 from roboticstoolbox import DHRobot, RevoluteDH, PrismaticDH
 from spatialmath import SE3
+import os 
 
 # === Funzioni utili ===
-def I_bar_along_x(m, L):
-    return np.diag([0, m * L**2 / 12, m * L**2 / 12])
+
 
 def I_bar_along_z(m, L):
-    return np.diag([0, m * L**2 / 12, 1e-4])
+    return np.diag([0, m * L**2 / 12,m * L**2 / 12])
 
 def rk4(dynamics, x, u, dt):
     k1 = dynamics(x, u)
@@ -25,10 +25,12 @@ def robot_dynamics(x, u):
     B = robot.inertia(q)
     C = robot.coriolis(q, qd)
     G = robot.gravload(q)
+    #print("‣ ||C·qd|| =", np.linalg.norm(C @ qd), "‣ ||G|| =", np.linalg.norm(G))
+
     qdd = np.linalg.solve(B, u - C @ qd - G)
 
     return np.concatenate((qd, qdd))
-
+# === Simulazione ===
 def compute_potential_energy(robot, q):
     V = 0
     T_links = robot.fkine_all(q)
@@ -42,9 +44,13 @@ def compute_potential_energy(robot, q):
     return V
 
 # === Parametri geometrici e dinamici ===
-D2 = 1.0
-L = [1.0, 1.0, 0.5, D2]
-m = [5.0, 3.0, 3.0, 3.0]
+m = [ 6.0,4.0,1.0,0.8 ]
+D2 = 0.10
+L = [0.40, 0.30, 0.0, D2]
+
+# D2 = 1.0
+# L = [1.0, 1.0, 0.5, D2]
+# m = [5.0, 3.0, 3.0, 3.0]
 alpha = [0.0, np.pi, 0.0, 0.0]
 r = [
     [L[0]/2, 0, 0],
@@ -53,8 +59,8 @@ r = [
     [0, 0, D2/2]
 ]
 I = [
-    I_bar_along_x(m[0], L[0]),
-    I_bar_along_x(m[1], L[1]),
+    I_bar_along_z(m[0], L[0]),
+    I_bar_along_z(m[1], L[1]),
     I_bar_along_z(m[2], L[2]),
     I_bar_along_z(m[3], L[3])
 ]
@@ -108,6 +114,13 @@ plt.title("Energia meccanica RRPR (con rk4)")
 plt.legend()
 plt.grid()
 plt.tight_layout()
-plt.show()
+#plt.show()
+import os
+
+os.makedirs("results/manipulator", exist_ok=True)
+plt.savefig("results/manipulator/energia_rrpr_corke.png")
+
 
 print(f"Variazione max energia totale: {max(E_tot) - min(E_tot):.6f} J")
+
+robot.plot(q0, block=True)

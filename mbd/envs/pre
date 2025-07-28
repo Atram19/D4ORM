@@ -1,0 +1,438 @@
+# import numpy as np
+# import matplotlib.pyplot as plt
+# from roboticstoolbox import DHRobot, RevoluteDH, PrismaticDH
+# from spatialmath import SE3
+# from scipy.integrate import solve_ivp
+
+# def dh_transform(theta, d,a,alpha):
+#     return np.array([
+#         [np.cos(theta), -np.sin(theta)*np.cos(alpha),  np.sin(theta)*np.sin(alpha), a*np.cos(theta)],
+#         [np.sin(theta),  np.cos(theta)*np.cos(alpha), -np.cos(theta)*np.sin(alpha), a*np.sin(theta)],
+#         [0,              np.sin(alpha),                np.cos(alpha),               d],
+#         [0,              0,                            0,                           1]
+#     ])
+# def forward_kinematics_RRPR(param, q, m):
+#     # q = [theta1, theta2, d3, theta4]
+#     theta1, theta2, d3, theta4 = q
+#     a1, a2, a3, a4 = param[:, 0]
+#     alpha1, alpha2, alpha3, alpha4 = param[:, 1]
+#     d1, d2, _, d4 = param[:, 2]
+#     m1, m2, m3, m4 = m
+
+#     T01 = dh_transform(theta1, d1, a1, alpha1)
+#     T12 = dh_transform(theta2, d2, a2, alpha2)
+#     T23 = dh_transform(0, d3, a3, alpha3)
+#     T34 = dh_transform(theta4, d4, a4, alpha4)
+
+#     T04 = T01 @ T12 @ T23 @ T34
+
+#     # CoM: metà dei link
+#     T01c = dh_transform(theta1, d1/2, a1/2, alpha1)
+#     T12c = dh_transform(theta2, d2/2, a2/2, alpha2)
+#     T23c = dh_transform(0, d3/2, a3/2, alpha3)
+#     T34c = dh_transform(theta4, d4/2, a4/2, alpha4)
+
+#     c1 = T01c[:3, 3]
+#     c2 = (T01 @ T12c)[:3, 3]
+#     c3 = (T01 @ T12 @ T23c)[:3, 3]
+#     c4 = (T01 @ T12  @T23 @ T34c)[:3, 3]
+
+#     # Pcom pesato sulle masse e sulle lunghezze
+#     total_length = d1 + d2 + d3 + d4
+#     pcom = (d1 * c1 + d2 * c2 + d3 * c3 + d4 * c4) / total_length
+#     #pcom = (m1 * c1 + m2 * c2 + m3 * c3 + m4 * c4) / sum(m)
+
+#     return T04, T01, T12, T23, T34, pcom
+
+
+# def rk4(dynamics, x, u, dt):
+#     k1 = dynamics(x, u)
+#     k2 = dynamics(x + dt/2 * k1, u)
+#     k3 = dynamics(x + dt/2 * k2, u)
+#     k4 = dynamics(x + dt * k3, u)
+#     return x + dt/6 * (k1 + 2*k2 + 2*k3 + k4)
+# def robot_dynamics(x, u):
+#     q = x[:4]
+#     qd = x[4:]
+#     robot.links[2].r = [0, 0, q[2]/2+2]  # aggiorna CoM dinamico
+
+#     B = robot.inertia(q)
+#     C = robot.coriolis(q, qd)
+#     G = robot.gravload(q)
+#     #print("‣ ||C·qd|| =", np.linalg.norm(C @ qd), "‣ ||G|| =", np.linalg.norm(G))
+
+#     qdd = np.linalg.solve(B, u - C @ qd - G)
+
+#     return np.concatenate((qd, qdd))
+# # === Simulazione ===
+# def compute_potential_energy(robot, q):
+#     V = 0
+#     T_links = robot.fkine_all(q)
+#     for i, link in enumerate(robot.links):
+#         r = np.array(link.r)
+#         if isinstance(link, PrismaticDH):
+#             r = np.array([0, 0, q[2]/2])  # corregge il CoM del link prismatico
+#         p_cmi = T_links[i] @ SE3(r)
+#         z = p_cmi.t[2]
+#         V += link.m * 9.81 * z
+#     return V
+
+# def I_bar_along_x(m, L):
+#     return np.diag([1e-4,m * L**2 / 12,m * L**2 / 12])
+
+# def I_bar_along_z(m, L):
+#     return np.diag([m * L**2 / 12, m * L**2 / 12,1e-4])
+
+# # Parametri base
+# D2 = 1.0
+# L = [1.0, 1.0, 0.5, D2]
+
+# m = [5.0, 3.0, 3.0, 3.0]
+# alpha = [0.0, np.pi,0 , 0.0]
+# d = [0.0, 0.0, 0.0, D2]
+# a = [L[0], L[1], L[2], L[3]]
+
+# param = np.column_stack([a, alpha, d])
+# # === Inerzie e centri di massa ===
+# I1 = I_bar_along_x(m[0],L[0])
+# I2 = I_bar_along_x(m[1],L[1])
+# I3 = I_bar_along_z(m[2],L[2])
+# I4 = I_bar_along_z(m[3],L[3])
+# # r = [
+# #     [L[0]/2, 0, 0],
+# #     [L[1]/2, 0, 0],
+# #     [0, 0, 0.25],
+# #     [0, 0, D2/2]
+# # ]
+# r = [
+#     [L[0]/2, 0, 0],          # Link 1
+#     [L[1]/2, 0, 0],          # Link 2
+#     [0, 0, 0.25 ],     # Link 3 (dipende da prismatico)
+#     [0, 0, D2/2 ]         # Link 4
+# ]
+
+
+
+# # === Robot ===
+# robot = DHRobot([
+#     RevoluteDH(d=0, a=L[0], alpha=alpha[0], m=m[0], r=r[0], I=I1),
+#     RevoluteDH(d=0, a=L[1], alpha=alpha[1], m=m[1], r=r[1], I=I2),
+#     PrismaticDH(theta=0, a=L[2], alpha=alpha[2], m=m[2], r=r[2], I=I3, qlim=[0.5, 1.5]),
+#     RevoluteDH(d=D2, a=L[3], alpha=alpha[3], m=m[3], r=r[3], I=I4)
+# ], name="RRPR")
+
+# robot.base = SE3(0, 0, 3.0)
+
+# robot.gravity = [0, 0, -9.81]
+# for link in robot.links:
+#     link.B = 0.0
+#     link.Tc = [0.0, 0.0]
+
+
+# for i, link in enumerate(robot.links):
+#     print(f"Link {i+1}: massa = {link.m}, centro di massa = {link.r}, I = {link.I}")
+# from scipy.integrate import solve_ivp
+
+# # === Stato iniziale ===
+# q0 = np.array([0.1, 0.1, 0.1, 0.1])
+# qd0 = np.zeros(4)
+# x0 = np.concatenate((q0, qd0))
+# T_sim = 5.0
+# t_eval = np.linspace(0, T_sim, 1000)
+# for i, link in enumerate(robot.links):
+#      print(f"Link {i+1}, r_z = {robot.fkine(q0) @ SE3(link.r)}")
+
+
+# # === Dinamica compatibile con solve_ivp ===
+# def dynamics_ivp(t, x):
+#     q = x[:4]
+#     qd = x[4:]
+
+#     # aggiorna centro di massa del link prismatico
+#     robot.links[2].r = [0, 0, q[2]/2]
+
+#     B = robot.inertia(q)
+#     C = robot.coriolis(q, qd)
+#     G = robot.gravload(q)
+#     u = np.zeros(4)
+
+
+#     qdd = np.linalg.solve(B, u - C @ qd - G)
+#     return np.concatenate((qd, qdd))
+
+# # === Simulazione con solve_ivp ===
+# sol = solve_ivp(dynamics_ivp, [0, T_sim], x0, method='RK45', t_eval=t_eval, rtol=1e-8, atol=1e-10)
+
+# # === Calcolo energia a ogni step ===
+# E_kin, E_pot, E_tot,q_tot = [], [], [],[]
+# T2 = robot.fkine_all(q0)[1]
+# print("T2 =\n", T2)
+
+# def compute_potential_energy(robot, q):
+#     V = 0
+#     T_links = robot.fkine_all(q)
+#     for i, link in enumerate(robot.links):
+#         r = np.array(link.r)
+#         if isinstance(link, PrismaticDH):
+#             r = [0, 0, q[2]/2]  # correggi dinamicamente
+#         p_cmi = T_links[i] @ SE3(r)
+#         z = p_cmi.t[2]
+#         V += link.m * 9.81 * z
+#     return V
+
+# for i in range(sol.y.shape[1]):
+#     q = sol.y[:4, i]
+#     qd = sol.y[4:, i]
+#     robot.links[2].r = [0, 0, q[2]/2]
+#     # T = robot.fkine_all(q)[i]
+#     # p = T @ SE3(link.r)
+#     # print(f"Link {i+1}, CoM (world):", p.t)
+#     B = robot.inertia(q)
+#     T = 0.5 * qd.T @ B @ qd
+#     V = compute_potential_energy(robot, q)
+#     E_kin.append(T)
+#     E_pot.append(V)
+#     E_tot.append(T + V)
+#     q_tot.append(q)
+
+# # === Plot energia ===
+# plt.plot(sol.t, E_kin, label='Energia cinetica')
+# plt.plot(sol.t, E_pot, label='Energia potenziale')
+# plt.plot(sol.t, E_tot, label='Energia totale')
+# plt.xlabel("Tempo [s]")
+# plt.ylabel("Energia [J]")
+# plt.title("Energia meccanica RRPR (solve_ivp RK45)")
+# plt.legend()
+# plt.grid()
+# plt.tight_layout()
+# plt.show()
+
+# print(f"Variazione max energia totale: {max(E_tot) - min(E_tot):.6f} J")
+
+# robot.plot(q0, block=True)
+
+import numpy as np
+import matplotlib.pyplot as plt
+from roboticstoolbox import DHRobot, RevoluteDH, PrismaticDH
+from spatialmath import SE3
+def dh_transform(theta, d,a,alpha):
+    return np.array([
+        [np.cos(theta), -np.sin(theta)*np.cos(alpha),  np.sin(theta)*np.sin(alpha), a*np.cos(theta)],
+        [np.sin(theta),  np.cos(theta)*np.cos(alpha), -np.cos(theta)*np.sin(alpha), a*np.sin(theta)],
+        [0,              np.sin(alpha),                np.cos(alpha),               d],
+        [0,              0,                            0,                           1]
+    ])
+def forward_kinematics_RRPR(param, q, m):
+    # q = [theta1, theta2, d3, theta4]
+    theta1, theta2, d3, theta4 = q
+    a1, a2, a3, a4 = param[:, 0]
+    alpha1, alpha2, alpha3, alpha4 = param[:, 1]
+    d1, d2, _, d4 = param[:, 2]
+    m1, m2, m3, m4 = m
+
+    T01 = dh_transform(theta1, d1, a1, alpha1)
+    T12 = dh_transform(theta2, d2, a2, alpha2)
+    T23 = dh_transform(0, d3, a3, alpha3)
+    T34 = dh_transform(theta4, d4, a4, alpha4)
+
+    T04 = T01 @ T12 @ T23 @ T34
+
+    # CoM: metà dei link
+    T01c = dh_transform(theta1, d1/2, a1/2, alpha1)
+    T12c = dh_transform(theta2, d2/2, a2/2, alpha2)
+    T23c = dh_transform(0, d3/2, a3/2, alpha3)
+    T34c = dh_transform(theta4, d4/2, a4/2, alpha4)
+
+    c1 = T01c[:3, 3]
+    c2 = (T01 @ T12c)[:3, 3]
+    c3 = (T01 @ T12 @ T23c)[:3, 3]
+    c4 = (T01 @ T12  @T23 @ T34c)[:3, 3]
+
+    # Pcom pesato sulle masse e sulle lunghezze
+    total_length = d1 + d2 + d3 + d4
+    pcom = (d1 * c1 + d2 * c2 + d3 * c3 + d4 * c4) / total_length
+    #pcom = (m1 * c1 + m2 * c2 + m3 * c3 + m4 * c4) / sum(m)
+
+    return T04, T01, T12, T23, T34, pcom
+
+
+def rk4(dynamics, x, u, dt):
+    k1 = dynamics(x, u)
+    k2 = dynamics(x + dt/2 * k1, u)
+    k3 = dynamics(x + dt/2 * k2, u)
+    k4 = dynamics(x + dt * k3, u)
+    return x + dt/6 * (k1 + 2*k2 + 2*k3 + k4)
+def robot_dynamics(x, u):
+    q = x[:4]
+    qd = x[4:]
+
+    B = robot.inertia(q)
+    C = robot.coriolis(q, qd)
+    G = robot.gravload(q)
+    #print("‣ ||C·qd|| =", np.linalg.norm(C @ qd), "‣ ||G|| =", np.linalg.norm(G))
+
+    qdd = np.linalg.solve(B, u - C @ qd - G)
+
+    return np.concatenate((qd, qdd))
+
+    
+# Parametri base
+# Nuove lunghezze
+L1 = 1.0
+L2 = 1.0
+L3 = 0.5
+D2 = 1.0
+L_d = 0.3   # se ti serve altrove
+
+# Nuove masse
+m = [5.0, 3.0, 3.0, 3.0]
+
+def I_f(mass, length):
+    I_val = mass * (length**2) / 12
+    return np.diag([0.0, 0.0, I_val])  # solo attorno a z per i revolute
+
+I1 = I_f(m[0], L1)
+I2 = I_f(m[1], L2)
+I3 = I_f(m[2], L3)
+I4 = I_f(m[3], D2)
+r1 = [L1/2, 0, 0]
+r2 = [L2/2, 0, 0]
+r3 = [0, 0, 0.25]
+r4 = [0, 0, D2/2]
+
+
+a = [L1, L2, L3, 0]  # parametri a_i
+alpha = [0, np.pi, 0, 0]  # parametri alpha_i
+# Lunghezze e offset
+
+d1, d2, d4 = 0.0, 0.0, D2
+a1, a2, a3, a4 = L1, L2, L3, 0.0
+alpha1, alpha2, alpha3, alpha4 = 0.0, np.pi, 0.0, 0.0
+
+# Parametri DH come matrice 4x3
+param = np.array([
+    [a1, alpha1, d1],
+    [a2, alpha2, d2],
+    [a3, alpha3, 0.0],   # d3 è variabile
+    [a4, alpha4, d4]
+])
+
+# Stato iniziale
+q = [0.0, 0.0, 0.1, 0.0]   # theta1, theta2, d3, theta4
+_, T01, T12, T23, T34, _ = forward_kinematics_RRPR(param, q, m)
+
+# Calcola centri di massa nel world frame
+T01c = dh_transform(q[0], d1/2, a1/2, alpha1)
+T12c = dh_transform(q[1], d2/2, a2/2, alpha2)
+T23c = dh_transform(0.0, q[2]/2, a3/2, alpha3)
+T34c = dh_transform(q[3], d4/2, a4/2, alpha4)
+
+com1_world = T01c[:3, 3]
+com2_world = (T01 @ T12c)[:3, 3]
+com3_world = (T01 @ T12 @ T23c)[:3, 3]
+com4_world = (T01 @ T12 @ T23 @ T34c)[:3, 3]
+from numpy.linalg import inv
+
+
+# Centri di massa nei frame locali (non world!)
+r1 = [L1/2, 0, 0]          # metà del primo link lungo x
+r2 = [L2/2, 0, 0]          # metà del secondo link lungo x
+r3 = [0, 0, q[2]/2]        # metà della prismatic joint lungo z
+r4 = [0, 0, D2/2]          # metà del link finale lungo z
+
+
+robot = DHRobot([
+    RevoluteDH(d=0, a=L1, alpha=0, m=m[0], r=r1, I=I1),
+    RevoluteDH(d=0, a=L2, alpha=0, m=m[1], r=r2, I=I2),
+    PrismaticDH(theta=0, a=L3, alpha=np.pi/2, m=m[2], r=r3, I=I3, qlim=[0.1, 0.5]),
+    RevoluteDH(d=D2, a=0, alpha=0, m=m[3], r=r4, I=I4)
+], name="RRPR_simple")
+
+for link in robot.links:
+    link.B = 0.0
+    link.Tc = [0.0, 0.0]
+# Verifica
+B = robot.inertia(q)
+cond = np.linalg.cond(B)
+eigvals = np.linalg.eigvalsh(B)
+
+print("Matrice B:\n", B)
+print(f"Condizionamento: {cond:.2e}")
+print(f"Autovalori: {eigvals}")
+
+
+
+q_num = [0.1, 0.1, 0.1, 0.1]
+robot.gravity = [0, 0, 9.81]
+for i, link in enumerate(robot.links):
+    print(f"Link {i+1}: massa = {link.m}, centro di massa = {link.r}, I = {link.I}")
+
+# Calcolo dinamica
+B = robot.inertia(q_num)
+
+C = robot.coriolis(q_num, [0, 0, 0, 0])
+
+G = robot.gravload(q_num)
+
+# Output
+print("Matrice di inerzia B(q):\n", B)
+print("Termine di Coriolis C(q, q̇):\n", C)
+print("Vettore della gravità G(q):\n", G)
+
+robot.plot(q_num, block=True)  # Visualizza la configurazione del robot
+
+# === Stato iniziale ===
+q = np.array([0.1, 0.1, 0.1, 0.1])
+qd = np.zeros(4)
+
+# === Setup simulazione ===
+dt = 0.001
+T_sim = 5
+steps = int(T_sim / dt)
+
+E_kin = []
+E_pot = []
+E_tot = []
+
+# === Funzione energia potenziale ===
+def compute_potential_energy(robot, q):
+    V = 0
+    T_links = robot.fkine_all(q)
+    for i, link in enumerate(robot.links):
+        T_i = T_links[i]
+        p_cmi = T_i @ SE3(link.r)  # posizione CM nel world frame
+        z = p_cmi.t[2]  # coordinata z
+        V += link.m * 9.81 * z
+    return V
+x = np.concatenate((q, qd))  # stato iniziale
+tau = np.zeros(4)
+for _ in range(steps):
+    x = rk4(robot_dynamics, x, tau, dt)
+    q = x[:4]
+    qd = x[4:]
+
+    B = robot.inertia(q)
+    if np.linalg.cond(B) > 1e10:
+        print("⚠️ B è quasi singolare!")
+    T = 0.5 * qd.T @ B @ qd
+    V = compute_potential_energy(robot, q)
+
+    E_kin.append(T)
+    E_pot.append(V)
+    E_tot.append(T + V)
+
+    
+
+# === Plot ===
+t = np.arange(0, T_sim, dt)
+plt.figure()
+plt.plot(t, E_kin, label='Energia cinetica')
+plt.plot(t, E_pot, label='Energia potenziale')
+plt.plot(t, E_tot, label='Energia totale')
+plt.xlabel("Tempo [s]")
+plt.ylabel("Energia [J]")
+plt.title("Energia meccanica del robot RRPR (Corke)")
+plt.legend()
+plt.grid()
+plt.tight_layout()
+plt.show()

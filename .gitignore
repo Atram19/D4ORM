@@ -5,3 +5,4 @@ __pycache__/
 *.png
 results/
 .history/
+venv_manip

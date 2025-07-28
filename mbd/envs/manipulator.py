@@ -1,5 +1,4 @@
-
-
+import sympy as sp
 # Variabili simboliche
 q = sp.Matrix(sp.symbols('q1:5'))     # q1, q2, q3, q4
 dq = sp.Matrix(sp.symbols('dq1:5'))   # dq1, dq2, dq3, dq4
@@ -89,7 +88,7 @@ T12_com = dh_transform(q[1], d[1], a[1]/2, alpha[1])
 T02_com = A1 * T12_com
 p2 = T02_com[:3, 3]
 z2 = T02_com[:3, 2]
-p1_full = (A1 @ sp.Matrix([0, 0, 0, 1]))[:3]
+p1_full = sp.Matrix((A1 @ sp.Matrix([0, 0, 0, 1]))[:3])
 J2 = sp.Matrix.hstack(
     z0.cross(p2 - p0).col_join(z0),
     z1.cross(p2 - p1_full).col_join(z1),
@@ -102,7 +101,7 @@ T23_com = dh_transform(0, q[2]/2, 0, alpha[2])  # CoM a metà corsa
 T03_com = A2 * T23_com
 p3 = T03_com[:3, 3]
 z3 = A2[:3, 2]  # z2 in frame base
-p2_full = (A2 @ sp.Matrix([0, 0, 0, 1]))[:3]
+p2_full = sp.Matrix((A2 @ sp.Matrix([0, 0, 0, 1]))[:3])
 J3 = sp.Matrix.hstack(
     z0.cross(p3 - p0).col_join(z0),
     z1.cross(p3 - p1_full).col_join(z1),
@@ -116,7 +115,7 @@ T34_com = dh_transform(q[3], d[3]/2, a[3], alpha[3])  # CoM a metà tratto
 T04_com = A3 * T34_com
 p4 = T04_com[:3, 3]
 z4 = A3[:3, 2]
-p3_full = (A3 @ sp.Matrix([0, 0, 0, 1]))[:3]
+p3_full =sp.Matrix( (A3 @ sp.Matrix([0, 0, 0, 1]))[:3])
 J4 = sp.Matrix.hstack(
     z0.cross(p4 - p0).col_join(z0),
     z1.cross(p4 - p1_full).col_join(z1),
