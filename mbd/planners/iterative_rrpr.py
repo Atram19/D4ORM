@@ -8,6 +8,13 @@ import matplotlib.pyplot as plt
 import tyro
 import jax.debug
 from mbd.envs.class_manipulator import RRPRSingleEnv, Args, rollout_single_us, forward_kinematics_rrpr_jax
+def cosine_beta_schedule(T, s=0.008):
+    t = jnp.arange(T + 1, dtype=jnp.float32)
+    f_t = jnp.cos(((t / T + s) / (1 + s)) * jnp.pi / 2) ** 2
+    alphas_bar = f_t / f_t[0]
+    alphas = alphas_bar[1:] / alphas_bar[:-1]
+    betas = 1 - alphas
+    return jnp.clip(betas, 1e-5, 0.999)
 
 def run_diffusion_once(args: Args, env, rollout_us, reset_env_jit):
     rng = jax.random.PRNGKey(seed=args.seed)
@@ -20,6 +27,8 @@ def run_diffusion_once(args: Args, env, rollout_us, reset_env_jit):
 
     # Diffusion noise schedule
     betas = jnp.linspace(args.beta0, args.betaT, args.Ndiffuse)
+    #betas = cosine_beta_schedule(args.Ndiffuse)
+
     alphas = 1.0 - betas
     alphas_bar = jnp.cumprod(alphas)
     sigmas = jnp.sqrt(1 - alphas_bar)
@@ -35,6 +44,8 @@ def run_diffusion_once(args: Args, env, rollout_us, reset_env_jit):
 
         rng, rng_eps = jax.random.split(rng)
         eps_u = jax.random.normal(rng_eps, (args.Nsample, args.Hsample, Nu))
+
+        
         Y0s = eps_u * sigmas[i] + Ybar_i
         Y0s = jnp.clip(Y0s,-1,1)
         Y0s_list.append(np.array(Y0s))
@@ -90,11 +101,71 @@ def run_diffusion_once(args: Args, env, rollout_us, reset_env_jit):
    
     return U_0
 
+def run_diffusion_local(args: Args, U_init: jnp.ndarray, env, rollout_us, reset_env_jit):
+    rng = jax.random.PRNGKey(seed=args.seed + 123)
+    rewards_per_iter = []
+
+    H = args.Hsample
+    Nu = env.action_size
+
+    U = U_init.copy()
+
+    L = 10  # window length
+    K = 10  # local iterations
+
+    betas = jnp.linspace(args.beta0, args.betaT, L)
+    alphas = 1.0 - betas
+    alphas_bar_local = jnp.cumprod(alphas)
+    sigmas_local = jnp.sqrt(1 - alphas_bar_local)
+
+    for k in range(K):
+        for t_start in range(0, H - L + 1, L // 2):
+            t_end = t_start + L
+            U_window = U[t_start:t_end]
+
+            rng, rng_step = jax.random.split(rng)
+
+            def reverse_once_local(U_w, rng_w):
+                for j in reversed(range(1, L)):
+                    eps_u = jax.random.normal(rng_w, (args.Nsample, L, Nu))
+                    sigma_local = sigmas_local[j]
+                    Y0s = eps_u * sigma_local + U_w  # (Nsample, L, Nu)
+
+                    Y0s = jnp.clip(Y0s, -1, 1)  # Clip to action bounds
+
+                    # Insert Y0s into full trajectory
+                    U_fulls = jnp.repeat(U[None, ...], args.Nsample, axis=0)  # (Nsample, H, Nu)
+                    U_fulls = U_fulls.at[:, t_start:t_end, :].set(Y0s)
+
+                    state_init = reset_env_jit(rng_step)
+                    rewss, _,_ = jax.vmap(rollout_us)(U_fulls)
+                    rews = rewss.mean(axis=-1)  # (Nsample,)
+
+                    logp0 = (rews - rews.mean()) / (rews.std() + 1e-6) / args.temp_sample
+                    weights = jax.nn.softmax(logp0)
+                    U_opt = jnp.einsum("s,slj->lj", weights, Y0s)
+
+                    U_new = jnp.sqrt(alphas_bar_local[j - 1]) * U_opt
+
+                return U_new
+
+            U_opt_local = reverse_once_local(U_window, rng_step)
+            U = U.at[t_start:t_end, :].set(U_opt_local)
+
+        state_init_eval = reset_env_jit(jax.random.PRNGKey(args.seed + 1024))
+        rewss_eval, _ ,_= rollout_us(U)
+        reward_mean = rewss_eval.mean()
+        rewards_per_iter.append(float(reward_mean))
+        print(f"[Iteration {k}] reward = {reward_mean:.4f}")
+
+    return U, rewards_per_iter
+
+
 def main():
     args = tyro.cli(Args)
 
     print("STEP 1: Initial Reverse Diffusion")
-    env = RRPRSingleEnv(dt = 0.01)
+    env = RRPRSingleEnv(dt = 0.005)
 
     step_env_jit = jax.jit(env.step)
     reset_env_jit = jax.jit(env.reset)
@@ -106,7 +177,8 @@ def main():
     U_init = run_diffusion_once(args, env, rollout_us_fn, reset_env_jit)
     t2 = time.time()
     print(f"Initial reverse diffusion time: {t2 - t1:.3f} s")
-
+    U_optimized, rewards_per_iter = run_diffusion_local(args=args,U_init=U_init,env=env,rollout_us=rollout_us_fn,reset_env_jit=reset_env_jit)
+    rewards_opt, x_traj, r_terms_opt = rollout_us_fn(U_optimized)
     rewards, x_traj, r_terms = rollout_us_fn(U_init)
     path = "results/manipulator"
     os.makedirs(path, exist_ok=True)
@@ -128,7 +200,20 @@ def main():
     fig, ax = plt.subplots(1, 1, figsize=(5, 5))
     ax.set_aspect('equal', adjustable='datalim')
 
-    env.render(x_init, tau_seq=U_init, rewards=rewards, r_terms=r_terms)
+    state = reset_env_jit(jax.random.PRNGKey(args.seed))
+    states = []
+    for t in range(U_init.shape[0]):
+        u_t = U_optimized[t]
+        state = step_env_jit(state, u_t)
+        states.append(state.pipeline_state)
+
+    x_opt = jnp.stack(states, axis=0)
+    fig1, ax1 = plt.subplots(1, 1, figsize=(5, 5))
+    ax1.set_aspect('equal', adjustable='datalim')
+
+    env.render(x_init, tau_seq=U_init, rewards=rewards, r_terms=r_terms, tag = "global")
+    env.render(x_opt, tau_seq=U_optimized, rewards=rewards_opt, r_terms=r_terms_opt, tag = "local")
+
 
 if __name__ == "__main__":
     main()

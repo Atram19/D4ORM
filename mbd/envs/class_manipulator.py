@@ -34,16 +34,15 @@ def dh_matrix(theta, d, a, alpha):
         [0.0, 0.0, 0.0, 1.0]
     ])
 
-jax.config.update("jax_debug_nans", True)
 @dataclass
 class Args:
     seed: int = 42
-    Nsample: int = 1024
+    Nsample: int = 2048
     Hsample: int = 100
     Ndiffuse: int = 100
-    beta0: float = 1e-5         # initial noise
-    betaT: float = 1e-1         # final noise  
-    temp_sample: float = 0.5
+    beta0: float = 1e-2        # initial noise
+    betaT: float = 1e-3         # final noise  
+    temp_sample: float = 0.1
     save_video: bool = False
 
 @partial(jax.jit, static_argnums=(1)) 
@@ -234,12 +233,19 @@ class RRPRSingleEnv:
         vel = q[4:]
 
         # === 1. Errore rispetto al goal in joint space
-        angle_errors_1 = angle_diff(pos[0],self.qf[0])
-        angle_errors_2 = angle_diff( pos[1],self.qf[1])
-        angle_errors_3 = angle_diff( pos[3],self.qf[3])
+        angle_errors_1 = angle_diff(self.qf[0],pos[0])
+        angle_errors_2 = angle_diff( self.qf[1],pos[1])
+        angle_errors_3 = angle_diff( self.qf[3],pos[3])
         linear_error = self.qf[2] - pos[2]
-        r_q_goal = -1.0 * (angle_errors_1**2 + angle_errors_2**2 + linear_error**2 + angle_errors_3**2)
+        # r_q_goal = -1.0 * (angle_errors_1**2 + angle_errors_2**2 + linear_error**2 + angle_errors_3**2)
+        joint_error = jnp.sqrt(
+            angle_errors_1**2 +
+            angle_errors_2**2 +
+           (5*linear_error)**2 +
+            angle_errors_3**2
+        )
 
+        r_q_goal = 5.0 * (1 - joint_error)
         # === 2. Errore dell’end-effector (in workspace)
         T_curr, *_ = forward_kinematics_rrpr_jax(pos, self.L1_num, self.L2_num, self.L3_num, self.L4_num, self.D2_num)
         ee_pos = T_curr[:3, 3]
@@ -247,24 +253,33 @@ class RRPRSingleEnv:
         T_goal, *_ = forward_kinematics_rrpr_jax(self.qf[:4], self.L1_num, self.L2_num, self.L3_num, self.L4_num, self.D2_num)
         ee_goal = T_goal[:3, 3]
 
-        err = jnp.linalg.norm( ee_pos-ee_goal)
-        r_goal = -10.0 * err**2
+        err = jnp.linalg.norm( ee_goal-ee_pos)
+        r_goal = 10.0 * (1-err)
+        
 
         # === 3. Penalità sul controllo (solo vicino al goal)
-        r_control =  -0.001 * jnp.sum(abs(u)**2)
+        r_control =  -0.01 * jnp.sum(abs(u)**2)
 
         # === 4. Penalità sulla velocità
-        r_vel = -0.001 * jnp.sum(abs(vel)**2)
-
-        # === 5. Penalità soft-barrier sui limiti dei giunti e velocità
+        # r_vel = -1* jnp.sum(abs(vel)**2)
+    
         
+        u_required = G_func_jitted(pos, self.m_num, self.g0_num, self.L1_num, self.L2_num, self.L3_num, self.L4_num)
+        delta_u = u - u_required.squeeze()
+        #r_control = -0.001 * jnp.sum(delta_u**2)
+        
+
+
+        vel_error = jnp.linalg.norm(self.qf[4:]-vel)
+        r_vel = 5.0 * (1-vel_error)
+
         # === 6. Reward totale pesato
         r_total = (
-            + 5.0 * r_q_goal
+            + 10.0 * r_q_goal
             + 10.0 * r_goal
-            + 1.0 * r_control
+            + 0.1 * r_control
             + 1.0 * r_vel
-           
+ 
         )
 
         r_terms = jnp.array([r_goal, r_q_goal, r_control, r_vel, r_total])
@@ -286,213 +301,152 @@ class RRPRSingleEnv:
     @property
     def num_robots(self):
         return 1
-    def render(self, X: jnp.ndarray, tau_seq: jnp.ndarray,rewards: jnp.ndarray = None,r_terms : jnp.ndarray=None):
+    def render(self, X: jnp.ndarray, tau_seq: jnp.ndarray, rewards: jnp.ndarray = None, r_terms: jnp.ndarray = None, tag: str = ""):
+
         """
-        Anima la traiettoria del manipolatore RRPR in 3D
-        + Mostra anche le q, dq, e torque nel tempo
+        Visualizzazione finale:
+        - Salva animazione 3D del robot
+        - Salva grafici statici per: posizioni angolari/prismatiche, velocità, torque, reward
         """
+        import os
+        import matplotlib.pyplot as plt
+        from matplotlib.animation import FuncAnimation
+        from mpl_toolkits.mplot3d import Axes3D
+        import numpy as np
+
+        os.makedirs("results/manipulator_diffusion", exist_ok=True)
+
         X = np.array(X)
         tau_seq = np.array(tau_seq)
         q_seq = X[:, :4]
         dq_seq = X[:, 4:]
-
         T = len(X)
-        import os
-        os.makedirs("results/manipulator_diffusion", exist_ok=True)
 
-        plt.figure(figsize=(12,6))
+        # === Indici giunti ===
+        q_ang_idx = [0, 1, 3]  # Angolari
+        q_pris_idx = [2]       # Prismatico
+
+        # === POSIZIONI angolari ===
+        plt.figure(figsize=(12, 6))
+        for i in q_ang_idx:
+            plt.plot(q_seq[:, i], label=f'q{i+1} (angolare)')
+        plt.title("Posizioni giunti angolari")
+        plt.xlabel("Step"); plt.ylabel("Angolo [rad]")
+        plt.grid(True); plt.legend()
+        plt.savefig(f"results/manipulator_diffusion/q_angolari_{tag}.png")
+        plt.close()
+
+        # === POSIZIONE prismatico ===
+        plt.figure(figsize=(12, 6))
+        for i in q_pris_idx:
+            plt.plot(q_seq[:, i], label=f'q{i+1} (prismatico)')
+        plt.title("Posizione giunto prismatico")
+        plt.xlabel("Step"); plt.ylabel("Distanza [m]")
+        plt.grid(True); plt.legend()
+        plt.savefig(f"results/manipulator_diffusion/q_prismatici_{tag}.png")
+        plt.close()
+
+        # === VELOCITÀ ===
+        plt.figure(figsize=(12, 6))
         for i in range(4):
-            plt.plot(q_seq[:,i], label=f'pos q{i+1}')
-        plt.title('Evoluzione delle posizioni dei giunti')
-        plt.xlabel('Step')
-        plt.ylabel('Posizione')
-        plt.legend()
-        plt.grid(True)
-        plt.savefig("results/manipulator_diffusion/posizioni_giunti.png")
+            plt.plot(dq_seq[:, i], label=f'dq{i+1}')
+        plt.title("Velocità dei giunti")
+        plt.xlabel("Step"); plt.ylabel("Velocità")
+        plt.grid(True); plt.legend()
+        plt.savefig(f"results/manipulator_diffusion/velocita_giunt_{tag}i.png")
         plt.close()
 
-        plt.figure(figsize=(12,6))
+        # === TORQUE ===
+        plt.figure(figsize=(12, 6))
         for i in range(4):
-            plt.plot(dq_seq[:,i], label=f'vel dq{i+1}')
-        plt.title('Evoluzione delle velocità dei giunti')
-        plt.xlabel('Step')
-        plt.ylabel('Velocità')
-        plt.legend()
-        plt.grid(True)
-        plt.savefig("results/manipulator_diffusion/velocita_giunti.png")
+            plt.plot(tau_seq[:, i], label=f'tau{i+1}')
+        plt.title("Azioni (Torque)")
+        plt.xlabel("Step"); plt.ylabel("Tau")
+        plt.grid(True); plt.legend()
+        plt.savefig(f"results/manipulator_diffusion/azioni_{tag}.png")
         plt.close()
 
-        plt.figure(figsize=(12,6))
-        for i in range(4):
-            plt.plot(tau_seq[:,i], label=f'tau{i+1}')
-        plt.title('Evoluzione delle azioni')
-        plt.xlabel('Step')
-        plt.ylabel('Tau')
-        plt.legend()
-        plt.grid(True)
-        plt.savefig("results/manipulator_diffusion/azioni.png")
-        plt.close()
+        # === REWARD ===
+        if rewards is not None:
+            plt.figure(figsize=(8, 4))
+            plt.plot(rewards)
+            plt.title("Reward ad ogni step")
+            plt.xlabel("Step"); plt.ylabel("Reward")
+            plt.grid(True)
+            plt.savefig(f"results/manipulator_diffusion/reward_{tag}.png")
+            plt.close()
 
-        plt.figure(figsize=(8,4))
-        plt.plot(rewards)
-        plt.title('Reward ad ogni step')
-        plt.xlabel('Step')
-        plt.ylabel('Reward')
-        plt.grid(True)
-        plt.savefig("results/manipulator_diffusion/reward.png")
-        plt.close()
+        # === TERMINI REWARD ===
+        if r_terms is not None:
+            labels = ["r_goal", "r_q_goal", "r_control", "r_vel", "r_total"]
+            plt.figure(figsize=(10, 6))
+            for i in range(min(r_terms.shape[1], 5)):
+                plt.plot(r_terms[:, i], label=labels[i])
+            plt.title("Termini della reward")
+            plt.xlabel("Step"); plt.ylabel("Valore")
+            plt.grid(True); plt.legend()
+            plt.tight_layout()
+            plt.savefig(f"results/manipulator_diffusion/reward_terms_{tag}.png")
+            plt.close()
 
-       
-        fig = plt.figure(figsize=(14, 12))
-        ax3d = fig.add_subplot(3, 2, 1, projection='3d')
-        ax_q = fig.add_subplot(3, 2, 2)
-        ax_dq = fig.add_subplot(3, 2, 3)
-        ax_tau = fig.add_subplot(3, 2, 4)
-        ax_r = fig.add_subplot(3, 2, 5)   # Reward
-        ax_e = fig.add_subplot(3, 2, 6)   # Error
+        # === ANIMAZIONE 3D ===
+        fig = plt.figure(figsize=(10, 8))
+        ax = fig.add_subplot(111, projection='3d')
+        ax.set_xlim([-0.8, 0.8]); ax.set_ylim([-0.8, 0.8]); ax.set_zlim([-0.5, 0.3])
+        ax.set_xlabel("x"); ax.set_ylabel("y"); ax.set_zlabel("z")
+        ax.view_init(elev=45, azim=45)
+        ax.grid(True)
 
-
-        fig2 = plt.figure()
-        # 3D settings
-        ax3d.set_xlim([-0.8, 0.8])
-        ax3d.set_ylim([-0.8, 0.8])
-        ax3d.set_zlim([-0.5, 0.3])
-        ax3d.set_xlabel('x'); ax3d.set_ylabel('y'); ax3d.set_zlabel('z')
-        ax3d.view_init(elev=45, azim=45)
-        ax3d.grid(True)
-        reward_line, = ax_r.plot([], [], 'g-', label="Reward")
-        error_line, = ax_e.plot([], [], 'r-', label="Goal Error")
-
-        ax_r.set_title("Reward over time"); ax_r.set_xlabel("t"); ax_r.set_ylabel("R(t)")
-        ax_r.grid(True); ax_r.legend()
-
-        ax_e.set_title("Goal error over time"); ax_e.set_xlabel("t"); ax_e.set_ylabel("||ee - goal||")
-        ax_e.grid(True); ax_e.legend()
-
-
-        robot_line, = ax3d.plot([], [], [], 'ko-', linewidth=2)
-        trail_line, = ax3d.plot([], [], [], 'b--', linewidth=1.5)
-        goal_point, = ax3d.plot([], [], [], 'rx', markersize=8, label='Goal')
-        title3d = ax3d.text2D(0.05, 0.95, "", transform=ax3d.transAxes)
-        ax3d.legend()
+        robot_line, = ax.plot([], [], [], 'ko-', linewidth=2)
+        trail_line, = ax.plot([], [], [], 'b--', linewidth=1.5)
+        goal_point, = ax.plot([], [], [], 'rx', markersize=8, label="Goal")
+        title3d = ax.text2D(0.05, 0.95, "", transform=ax.transAxes)
+        ax.legend()
 
         trail_x, trail_y, trail_z = [], [], []
-        error_buffer = []
-
-        # Plot placeholders
-        q_lines = [ax_q.plot([], [], label=f'q{i+1}')[0] for i in range(4)]
-        dq_lines = [ax_dq.plot([], [], label=f'dq{i+1}')[0] for i in range(4)]
-        tau_lines = [ax_tau.plot([], [], label=f'tau{i+1}')[0] for i in range(4)]
-
-        for ax, name in [(ax_q, 'q'), (ax_dq, 'dq'), (ax_tau, 'tau')]:
-            ax.set_xlim([0, T])
-            ax.set_ylabel(name)
-            ax.set_xlabel("Step")
-            ax.grid(True)
-            ax.legend()
-        # == Se ci sono i r_terms, plot separato ==
-        if r_terms is not None:
-            fig_terms = plt.figure(figsize=(10, 6))
-            ax_terms = fig_terms.add_subplot(1, 1, 1)
-            labels = ["r_goal", "r_q_goal", "r_control", "r_vel", "r_total"] 
-            for i in range(min(r_terms.shape[1], 5)):
-                ax_terms.plot(r_terms[:, i], label=labels[i])
-            ax_terms.set_title("Andamento dei singoli termini di reward")
-            ax_terms.set_xlabel("Step")
-            ax_terms.set_ylabel("Valore")
-            ax_terms.grid(True)
-            ax_terms.legend()
-            fig_terms.tight_layout()
 
         def update(frame):
             nonlocal trail_x, trail_y, trail_z
 
-            if frame == 0:
-                trail_x.clear()
-                trail_y.clear()
-                trail_z.clear()
-
             q = q_seq[frame]
-            dq = dq_seq[frame]
-            tau = tau_seq[frame]
-
             qf = np.array(self.qf[:4])
-            L1, L2, D2 = self.L1_num, self.L2_num, self.D2_num
 
-            # Calcola le trasformazioni intermedie
-            T04, T01, T12, T23, T34 = forward_kinematics_rrpr_jax(q, self.L1_num, self.L2_num,self.L3_num,self.L4_num, self.D2_num)
+            # Forward kinematics
+            T04, T01, T12, T23, T34 = forward_kinematics_rrpr_jax(q, self.L1_num, self.L2_num, self.L3_num, self.L4_num, self.D2_num)
             T02 = T01 @ T12
             T03 = T02 @ T23
             T04 = T03 @ T34
 
-            # Joint positions: base, joint1, joint2, joint3, end-effector
             p0 = jnp.array([0, 0, 0])
             p1 = T01[:3, 3]
             p2 = T02[:3, 3]
             p3 = T03[:3, 3]
-            p4 = T04[:3, 3]  # end-effector
-
+            p4 = T04[:3, 3]
             points = np.stack([p0, p1, p2, p3, p4], axis=0)
             ee_pos = np.array(p4)
 
-            # Goal position (end-effector)
-            T_goal,*_ = forward_kinematics_rrpr_jax(qf, self.L1_num, self.L2_num,self.L3_num,self.L4_num, self.D2_num)
+            # Goal
+            T_goal, *_ = forward_kinematics_rrpr_jax(qf, self.L1_num, self.L2_num, self.L3_num, self.L4_num, self.D2_num)
             ee_goal = np.array(T_goal[:3, 3])
-            e = ee_pos-ee_goal
-            # Aggiorna linea robotica
+
             robot_line.set_data(points[:, 0], points[:, 1])
             robot_line.set_3d_properties(points[:, 2])
             goal_point.set_data([ee_goal[0]], [ee_goal[1]])
             goal_point.set_3d_properties([ee_goal[2]])
 
-            # Trail
             trail_x.append(ee_pos[0])
             trail_y.append(ee_pos[1])
             trail_z.append(ee_pos[2])
             trail_line.set_data(trail_x, trail_y)
             trail_line.set_3d_properties(trail_z)
+
             title3d.set_text(f"Frame {frame}")
-
-            # q, dq, tau plots
-            x_vals = np.arange(frame + 1)
-            for i in range(4):
-                q_lines[i].set_data(x_vals, q_seq[:frame+1, i])
-                dq_lines[i].set_data(x_vals, dq_seq[:frame+1, i])
-                tau_lines[i].set_data(x_vals, tau_seq[:frame+1, i])
-                for ax in [ax_q, ax_dq, ax_tau]:
-                    ax.set_xlim([0, T])
-                    ax.relim(); ax.autoscale_view()
-
-            if rewards is not None:
-                reward_line.set_data(np.arange(frame + 1), rewards[:frame+1])
-                ax_r.set_xlim([0, T])
-                ax_r.relim(); ax_r.autoscale_view()
-
-            error_norm = np.linalg.norm(e)
-            if frame == 0:
-                self.error_buffer = [error_norm]
-            else:
-                self.error_buffer.append(error_norm)
-            error_line.set_data(np.arange(frame + 1), self.error_buffer)
-            ax_e.set_xlim([0, T])
-            ax_e.relim()
-            ax_e.autoscale_view()
-
-            
-
-            return (
-                robot_line, trail_line, title3d, goal_point,
-                *q_lines, *dq_lines, *tau_lines,
-                reward_line, error_line
-            )
-        
-       
+            return robot_line, trail_line, goal_point, title3d
 
         ani = FuncAnimation(fig, update, frames=T, interval=50)
-        ani.save("results/manipulator_diffusion/motion_extended.mp4", writer='ffmpeg', fps=20)
+        ani.save(f"results/manipulator_diffusion/motion_3D_{tag}.mp4", writer='ffmpeg', fps=20)
+        plt.close(fig)
 
-        plt.tight_layout()
-        plt.show()
 
 
 def compute_kinetic_energy(q, dq,self):
@@ -512,7 +466,7 @@ def compute_potential_energy(q,self):
     z3 = T03[2, 3]
     z4 = T04[2, 3]
 
-    g = -self.g0_num[2]  # gravità positiva = 9.81
+    g = -self.g0_num[2]  
 
     V = self.m_num[0]*g*z1 + self.m_num[1]*g*z2 + self.m_num[2]*g*z3 + self.m_num[3]*g*z4
     return V
