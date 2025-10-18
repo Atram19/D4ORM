@@ -1,0 +1,848 @@
+# class_crane.py
+# Ambiente dinamico per il carroponte con pendolo (swing-up)
+
+import jax
+import jax.numpy as jnp
+from flax import struct
+from jax import jit
+from dataclasses import dataclass
+from functools import partial
+from functools import partial
+from mbd.envs.carroponte import f_fun, g_fun, h_fun
+import matplotlib.pyplot as plt
+import os
+import numpy as np
+from matplotlib.animation import FuncAnimation
+from matplotlib import cm
+from jax import debug
+import matplotlib
+import tkinter as tk
+import tyro
+
+@struct.dataclass
+class Args:
+    seed: int = 0
+    Nsample: int = 2048
+    Hsample: int = 100
+    Ndiffuse: int = 100
+    beta0: float = 1e-3
+    betaT: float = 1e-4
+    temp_sample: float = 0.1
+    save_video: bool = False
+
+def rollout_single_us(step_env, state, us):
+    def step_fn(state, u_t):
+        state = step_env(state, u_t)
+        return state, (state.reward, state.pipeline_state, state.r_terms)
+
+    _, (rews, states, r_terms) = jax.lax.scan(step_fn, state, us)
+    states = jnp.vstack([state.pipeline_state[None], states])
+    rews = jnp.hstack([0.0, rews])
+    return rews, states, r_terms
+@struct.dataclass
+class State:
+    pipeline_state: jnp.ndarray  # stato: [theta, dtheta, x, dx]
+    reward: float
+    r_terms: jnp.ndarray
+
+class CranePendulumEnv:
+    def __init__(self, dt=0.04):
+        self.dt = dt
+        self.H = 100
+
+        # Parametri fisici
+        # self.M = 1.0   # massa carrello
+        # self.m = 0.1   # massa pendolo
+        # self.l = 0.5   # lunghezza pendolo
+        # self.g = 9.81  # gravità
+        # self.b1 = 0.01 # attrito angolare
+        # self.b2 = 0.02 # attrito traslazionale
+        # self.B = self.m
+        # self.C = self.M + self.m
+        # self.D = self.l * (self.M + self.m)
+        self.l = 0.5
+        self.g = 9.80665
+        self.r = 0.02
+
+        self.m1 = 0.2
+        self.m2 = 0.022245336
+        self.M  = 0.6
+
+        self.b1 = 1e-5
+        self.b2 = 1e-5
+
+        # Parametri derivati
+        self.B = self.m1 + self.m2 / 3.0
+        self.C = self.m1 + self.m2 + self.M
+        self.D = (2.0 / 5.0) * self.m1 * self.r ** 2
+
+
+        # Azione massima (forza)
+        self.max_u =4
+
+        # Stato iniziale e goal: pendolo in basso -> in alto
+        self.q0 = jnp.array([0.1, 0.1, 0.1, 0.1])
+        self.qf = jnp.array([jnp.pi, 0.0, 0.0, 0.0])
+
+    def dynamics(self, q, u):
+        theta, dtheta, x, dx = q
+        # Parametri locali
+        B, C, D = self.B, self.C, self.D
+        g, l = self.g, self.l
+        b1, b2 = self.b1, self.b2
+
+        # Dinamica esplicita
+        dq1 = dtheta
+        dq2 = (-b1*dtheta)/D \
+            + ((-b2*dx - g*l*jnp.sin(theta)*B) * l*jnp.cos(theta)*B) / ((C + l*jnp.cos(theta)*B)*D) \
+            - (g*l*jnp.sin(theta)*B)/D \
+            - u * (l*jnp.cos(theta)*B) / ((C + l*jnp.cos(theta)*B)*D)
+
+        dq3 = dx
+        
+        dq4 = (-b2*dx - g*l*jnp.sin(theta)*B)/(C + l*jnp.cos(theta)*B) \
+            + u / ((C + l*jnp.cos(theta)*B)*D)
+
+        dq1 = dq1.reshape(())
+        dq2 = dq2.reshape(())
+        dq3 = dq3.reshape(())
+        dq4 = dq4.reshape(())
+        return jnp.array([dq1, dq2, dq3, dq4])
+
+
+    def rk4(self, f, x, u, dt):
+        k1 = f(x, u)
+        k2 = f(x + dt/2 * k1, u)
+        k3 = f(x + dt/2 * k2, u)
+        k4 = f(x + dt * k3, u)
+        return x + dt/6 * (k1 + 2*k2 + 2*k3 + k4)
+
+    @partial(jax.jit, static_argnums=(0,))
+    def reset(self, rng):
+        return State(pipeline_state=self.q0, reward=0.0, r_terms=jnp.zeros(3))
+
+    @partial(jax.jit, static_argnums=(0,))
+    def step(self, state: State, action: jax.Array) -> State:
+        u = jnp.clip(action, -1.0, 1.0) 
+        action_scaled = u* self.max_u
+        q_next = self.rk4(self.dynamics, state.pipeline_state, action_scaled, self.dt)
+        r, r_terms = self.get_reward(q_next, u)
+      
+        return State(pipeline_state=q_next, reward=r, r_terms=r_terms)
+
+    def get_reward(self, q, u, v_max=1.0, w_max=6.0, lam=0.6, alpha_theta=1.0):
+        theta, dtheta, x, dx = q
+        m = self.m1 + self.m2
+        M = self.M
+        l = self.l
+        g = self.g
+
+        # === Potenziale normalizzato ===
+        E_pot_norm = 0.5 * (1.0 + jnp.cos(theta))
+        # === Cinetica normalizzata ===
+        E_kin = (
+            0.5 * (M + m) * dx**2
+            + 0.5 * m * ((dx + l * jnp.cos(theta) * dtheta)**2 + (-l * jnp.sin(theta) * dtheta)**2)
+        )
+        E0 = 0.5*(M+m)*v_max**2 + 0.5*m*((v_max + l*w_max)**2 + (l*w_max)**2)
+        E_kin_norm = 1.0 - jnp.exp(-E_kin / (E0 + 1e-8))
+
+        # === Reward base ===
+        r_base = lam * E_pot_norm + (1.0 - lam) * (1.0 - E_kin_norm)
+
+        # === Penalizzazione controllo (facoltativa) ===
+        r_u = -0.01 * u**2
+
+        # === Penalizzazione angolo fuori range ===
+        theta_max = jnp.pi/2
+        r_theta = -alpha_theta * jnp.maximum(0.0, jnp.abs(theta) - theta_max)**2
+
+        # === Reward totale ===
+        
+        r_base = jnp.asarray(r_base).reshape(())
+        r_theta = jnp.asarray(r_theta).reshape(())
+        r_u = jnp.asarray(r_u).reshape(())
+        E_pot_norm = jnp.asarray(E_pot_norm).reshape(())
+        E_kin_norm = jnp.asarray(E_kin_norm).reshape(())
+       # jax.debug.print("r_base: {r_base}, r_u: {r_u}, r_theta: {r_theta}, E_pot: {E_pot}, E_kin: {E_kin}", r_base=r_base, r_u=r_u, r_theta=r_theta, E_pot=E_pot_norm, E_kin=E_kin_norm)
+        r_total = r_base + r_u + r_theta
+        r_total = jnp.asarray(r_total).reshape(())
+
+        # Termini singoli (debug)
+        r_terms = jnp.array([E_pot_norm, -(E_kin_norm), r_u])
+        return r_total, r_terms
+
+
+
+    def render(self, x_traj, U=None, rewards=None, r_terms=None, tag=""):
+        import matplotlib.pyplot as plt
+        import os
+
+        x_traj = jax.device_get(x_traj)
+        T = x_traj.shape[0]
+        t = jnp.linspace(0, T * self.dt, T)
+
+        fig, axs = plt.subplots(4, 1, figsize=(8, 10), sharex=True)
+        fig.suptitle(f"Carroponte - Traiettoria Ottimizzata [{tag}]")
+
+        theta = x_traj[:, 0]
+        dtheta = x_traj[:, 1]
+        x = x_traj[:, 2]
+        dx = x_traj[:, 3]
+
+        axs[0].plot(t, theta)
+        axs[0].set_ylabel("θ (rad)")
+
+        axs[1].plot(t, dtheta)
+        axs[1].set_ylabel("dtheta/dt (rad/s)")
+
+        axs[2].plot(t, x)
+        axs[2].set_ylabel("x (m)")
+
+        axs[3].plot(t, dx)
+        axs[3].set_ylabel("dx/dt (m/s)")
+        axs[3].set_xlabel("Tempo (s)")
+
+        plt.tight_layout()
+        os.makedirs("results/crane/figs", exist_ok=True)
+        plt.savefig(f"results/crane/figs/states_{tag}.png")
+        plt.close()
+
+        # === Plot controllo ===
+        if U is not None:
+            U = jax.device_get(U).squeeze()
+            t_u = jnp.linspace(0, T * self.dt, U.shape[0])
+
+            plt.figure(figsize=(6, 3))
+            plt.plot(t_u, U)
+            plt.title(f"Forza di controllo [{tag}]")
+            plt.xlabel("Tempo (s)")
+            plt.ylabel("F (N)")
+            plt.grid(True)
+            plt.tight_layout()
+            plt.savefig(f"results/crane/figs/control_{tag}.png")
+            plt.close()
+
+        # === Plot reward terms ===
+        if r_terms is not None:
+            r_terms = jax.device_get(r_terms)
+            n_terms = r_terms.shape[1]
+            labels = [f"r{i}" for i in range(n_terms)]
+
+            plt.figure(figsize=(7, 4))
+            for i in range(n_terms):
+                plt.plot(t, r_terms[:, i], label=labels[i])
+            plt.title(f"Termini di reward [{tag}]")
+            plt.xlabel("Tempo (s)")
+            plt.legend()
+            plt.grid(True)
+            plt.tight_layout()
+            plt.savefig(f"results/crane/figs/r_terms_{tag}.png")
+            plt.close()
+
+        # === Plot reward totale ===
+        if rewards is not None:
+            rewards = jax.device_get(rewards)
+            t_r = jnp.linspace(0, rewards.shape[0] * self.dt, rewards.shape[0])
+
+            plt.figure(figsize=(6, 3))
+            plt.plot(t_r, rewards)
+            plt.title(f"Reward totale [{tag}]")
+            plt.xlabel("Tempo (s)")
+            plt.ylabel("Reward")
+            plt.grid(True)
+            plt.tight_layout()
+            plt.savefig(f"results/crane/figs/reward_{tag}.png")
+            plt.close()
+
+
+    @property
+    def action_size(self):
+        return 1
+
+    @property
+    def observation_size(self):
+        return 4
+# def get_reward(self, q, u):
+    #     theta, dtheta, x, dx = q
+    #     m = self.m1 + self.m2
+    #     M = self.M
+    #     l = self.l
+    #     g = self.g
+
+    #     # === Potenziale normalizzato ===
+    #     # Potenziale normalizzata coerente con "in alto"
+    #     E_pot_norm = 0.5 * (1.0 - jnp.cos(theta))
+
+    #     # === Cinetica normalizzata ===
+    #     E_kin = (
+    #         0.5 * (M + m) * dx**2
+    #         + 0.5 * m * ((dx + l * jnp.cos(theta) * dtheta)**2 + (-l * jnp.sin(theta) * dtheta)**2)
+    #     )
+    #     E_kin_max = 1  # tuning necessario   
+    #     E_mech = E_pot_norm - E_kin / E_kin_max
+    #     r_base = 1.0 - (E_mech - 1.0)**2
+
+
+
+    #     # === Reward base ===
+    #     #r_base =  E_pot_norm - E_kin
+
+    #     # # === Penalizzazione controllo (facoltativa) ===
+    #     r_u = -0.01 * u**2
+
+    #     # # === Penalizzazione angolo fuori range ===
+    #     # theta_max = jnp.pi/2
+    #     # r_theta = -alpha_theta * jnp.maximum(0.0, jnp.abs(theta) - theta_max)**2
+
+    #     # === Reward totale ===
+        
+    #     r_base = jnp.asarray(r_base).reshape(())
+    #     #r_theta = jnp.asarray(r_theta).reshape(())
+    #     r_u = jnp.asarray(r_u).reshape(())
+    #     E_pot_norm = jnp.asarray(E_pot_norm).reshape(())
+    #     E_kin = jnp.asarray(E_kin).reshape(())
+    #     # jax.debug.print("r_base: {r_base}, r_u: {r_u}, r_theta: {r_theta}, E_pot: {E_pot}, E_kin: {E_kin}", r_base=r_base, r_u=r_u, r_theta=r_theta, E_pot=E_pot_norm, E_kin=E_kin_norm)
+    #     r_total = r_base# + r_u #+ r_theta
+    #     r_total = jnp.asarray(r_total).reshape(())
+
+    #     # Termini singoli (debug)
+    #     r_terms = jnp.array([E_pot_norm, -(E_kin), r_u])
+    #     return r_total, r_terms
+    # def get_reward(self, q, u):
+    #     theta, dtheta, x, dx = q
+    #     m = self.m1 + self.m2
+    #     M = self.M
+    #     l = self.l
+    #     g = self.g
+
+    #     # Potenziale normalizzata (pendolo in alto = 1)
+    #     E_pot_norm = 0.5 * (1.0 - jnp.cos(theta))
+
+    #     # Cinetica non normalizzata
+    #     E_kin = (
+    #         0.5 * (M + m) * dx**2 +
+    #         0.5 * m * ((dx + l * jnp.cos(theta) * dtheta)**2 + (-l * jnp.sin(theta) * dtheta)**2)
+    #     )
+
+    #     # Cinetica normalizzata
+    #     E_kin_max = 1.0  # tuning necessario
+    #     E_kin_norm = E_kin / E_kin_max
+
+    #     # Reward energetica stile do-mpc
+    #     E_mech = E_pot_norm + E_kin_norm
+    #     r_energy = - (E_mech - 1.0)**2
+
+    #     # Penalità controllo
+    #     r_ctrl = - 0.01 * u**2
+
+    #     # Totale
+    #     r_total = r_energy + r_ctrl
+    #     r_total = jnp.asarray(r_total).reshape(())
+    #     r_total = jnp.asarray(r_total).reshape(())
+    #     r_ctrl = jnp.asarray(r_ctrl).reshape(())
+    #     E_pot_norm = jnp.asarray(E_pot_norm).reshape(())
+    #     E_kin_norm = jnp.asarray(E_kin_norm).reshape(())
+    #     r_energy = jnp.asarray(r_energy).reshape(())
+        
+    #     r_terms = jnp.array([E_pot_norm, -E_kin_norm, r_ctrl])
+    #     return r_total, r_terms
+
+    # def get_reward(self, q, u):
+    #     """
+    #     Reward focalizzata sulla stabilizzazione del pendolo in alto.
+    #     q: [theta, dtheta, x, dx]
+    #     u: controllo (forza/coppia)
+    #     """
+
+    #     theta, dtheta, x, dx = q
+
+    #     # Pesi. Puoi modificarli/testare.
+    #     w_theta = 100.0   # penalità deviazione angolo
+    #     w_dtheta = 0.5  # penalità velocità angolare
+    #     w_x = 0.05      # penalità posizione carrello
+    #     w_dx = 0.005     # penalità velocità carrello
+    #     w_u = 0.01      # penalità azione di controllo
+
+    #     # Reward negativa (costo)
+    #     delta_theta = (theta - jnp.pi + jnp.pi) % (2 * jnp.pi) - jnp.pi  # differenza angolo modulo 2pi in [-pi, pi]
+
+    #     r_theta = - w_theta * delta_theta ** 2
+    #     #r_theta = 1.0 - jnp.abs(theta - jnp.pi) / jnp.abs(self.q0[0] - jnp.pi)
+
+    #     reward = (
+    #         r_theta
+    #       #  - w_dtheta * (dtheta)**2
+    #         - w_x * (x)**2
+    #         - w_dx * (dx)**2
+    #         - w_u * (u)**2
+    #     )
+    #     reward = jnp.asarray(reward).reshape(())
+    #     # Puoi restituire anche termini separati per log/debug se vuoi:
+    #     r_terms = jnp.array([
+    #         - w_theta * (theta)**2,
+    #         - w_dtheta * (dtheta)**2,
+    #         - w_x * (x)**2,
+           
+    #     ])
+    #     r_terms = jnp.asarray(r_terms).reshape((-1,))
+    #     return reward, r_terms
+    # def get_reward(self, q, u):
+    #     theta, dtheta, x, dx = q
+
+    #     # parametri normalizzazione
+    #     dtheta_max = 4.0  # rad/s
+    #     dx_max = 2.0       # m/s
+    #     u_max = 10.0       # azione max
+
+    #     # pesi
+    #     w_theta = 4.0
+    #     w_dtheta = 0.8
+    #     w_dx = 0.001
+    #     w_u = 0.001
+
+    #     # errore angolare wrapped
+    #     delta_theta = (theta - jnp.pi + jnp.pi) % (2 * jnp.pi) - jnp.pi
+    #     r_goal = 1.0 - jnp.abs(delta_theta) / jnp.pi   # [0,1]
+
+    #     r_dtheta = 1.0 / (1.0 + (dtheta/dtheta_max)**2)
+    #     r_dx     = 1.0 / (1.0 + (dx/dx_max)**2)
+    #     r_u      = 1.0 / (1.0 + (u/u_max)**2)
+
+        
+    #     r_u = jnp.asarray(r_u).reshape(())
+    #     r_goal = jnp.asarray(r_goal).reshape(())
+    #     r_dtheta = jnp.asarray(r_dtheta).reshape(())
+    #     r_dx = jnp.asarray(r_dx).reshape(())
+
+    #     # media pesata
+
+    #     reward = (w_theta * r_goal + w_dtheta * r_dtheta + w_dx * r_dx + w_u * r_u) / (w_theta + w_dtheta + w_dx + w_u)
+    #     reward = jnp.asarray(reward).reshape(())
+
+
+    #     r_terms = jnp.array([r_goal, r_dtheta, r_dx])
+    #     r_terms = jnp.asarray(r_terms).reshape((-1,))
+    #     return reward, r_terms
+    
+
+
+    %%%% PRIMA 
+    # class_crane.py
+# Ambiente dinamico per il carroponte con pendolo (swing-up)
+
+import jax
+import jax.numpy as jnp
+from flax import struct
+from jax import jit
+from dataclasses import dataclass
+from functools import partial
+from mbd.envs.carroponte import f_fun, g_fun, h_fun
+import matplotlib.pyplot as plt
+import os
+import numpy as np
+from matplotlib.animation import FuncAnimation
+from matplotlib import cm
+from jax import debug
+import matplotlib
+import tkinter as tk
+import tyro
+@struct.dataclass
+class Args:
+    seed: int = 42
+    Nsample: int = 4096
+    Hsample: int = 300
+    Ndiffuse: int = 500
+    beta0: float = 1e-2
+    betaT: float = 1e-3# era 4
+    temp_sample: float = 0.1
+    save_video: bool = False
+
+def rollout_single_us(step_env, state, us):
+    def step_fn(state, u_t):
+        state = step_env(state, u_t)
+        return state, (state.reward, state.pipeline_state, state.r_terms)
+
+    _, (rews, states, r_terms) = jax.lax.scan(step_fn, state, us)
+    states = jnp.vstack([state.pipeline_state[None], states])
+    rews = jnp.hstack([0.0, rews])
+    return rews, states, r_terms
+
+@struct.dataclass
+class State:
+    pipeline_state: jnp.ndarray  # stato: [theta, dtheta, x, dx]
+    reward: float
+    r_terms: jnp.ndarray
+
+
+
+class CranePendulumEnv:
+    def __init__(self, dt=0.04):
+        self.dt = dt
+        self.H = 100
+
+        # Parametri fisici (ispirati al file do-mpc)
+        self.M = 10    # massa carrello [kg]
+        self.m = 1   # massa pendolo [kg]
+        self.l = 1    # lunghezza pendolo [m]
+        self.g = 9.81   # gravità [m/s^2]
+        self.b = 0.
+        # # Inerzia (pendolo uniforme)
+        # self.I = (self.m * (self.l/2)**2) / 3.0
+
+        # # Coefficienti derivati
+        # self.C = self.M + self.m
+        # self.B = self.m * (self.l/2)   # accoppiamento
+        # self.D = self.I + self.m * (self.l/2)**2
+
+        # # Attriti
+        # self.b1 = 0.0   # attrito articolazione
+        # self.b2 = 0.0   # attrito carrello
+
+        # Azione massima (forza)
+        self.max_u = 50
+
+        # Stato iniziale e obiettivo (pendolo in basso -> in alto)
+        self.q0 = jnp.array([0.9*jnp.pi, 0.0, 0.0, 0.0])
+        self.qf = jnp.array([0, 0.0, 0.0, 0.0])
+
+    # def dynamics(self, q, u):
+    #     theta, dtheta, x, dx = q
+    #     theta   = jnp.asarray(theta).reshape(())
+    #     dtheta  = jnp.asarray(dtheta).reshape(())
+    #     x       = jnp.asarray(x).reshape(())
+    #     dx      = jnp.asarray(dx).reshape(())
+    #     u       = jnp.asarray(u).reshape(())
+
+    #     # # Matrice di massa
+    #     # Mmat = jnp.array([
+    #     #     [self.D,               self.B*jnp.cos(theta)],
+    #     #     [self.B*jnp.cos(theta), self.C              ]
+    #     # ])
+
+    #     # # Vettore forze
+    #     # rhs = jnp.array([
+    #     #     -self.B*self.g*jnp.sin(theta) - self.b1*dtheta,
+    #     #     u - self.B*jnp.sin(theta)*dtheta**2 - self.b2*dx
+    #     # ]).reshape(-1)
+
+    #     # Accelerazioni (2,)
+    #     acc = jnp.linalg.solve(Mmat, rhs).reshape(-1)
+    #     ddtheta, ddx = acc
+
+    #     return jnp.array([dtheta, ddtheta, dx, ddx])
+    def dynamics(self, q, u):
+        theta, dtheta, x, dx = q
+        # Parametri locali
+        # B, C, D = self.B, self.C, self.D
+        # g, l = self.g, self.l
+        # b1, b2 = self.b1, self.b2
+
+        # Dinamica esplicita
+        dq1 = dtheta
+        dq2 = (self.M*self.g*jnp.sin(theta) + self.b*dx*jnp.cos(theta) + self.g*self.m*jnp.sin(theta) - self.l*self.m*dtheta**2*jnp.sin(2*theta)/2 - u*jnp.cos(theta))/(self.l*(self.M + self.m*jnp.sin(theta)**2))
+        dq3 = dx
+        dq4 = (-self.b*dx - self.g*self.m*jnp.sin(2*theta)/2 + self.l*self.m*dtheta**2*jnp.sin(theta) + u)/(self.M + self.m*jnp.sin(theta)**2)
+
+        dq1 = dq1.reshape(())
+        dq2 = dq2.reshape(())
+        dq3 = dq3.reshape(())
+        dq4 = dq4.reshape(())
+        return jnp.array([dq1, dq2, dq3, dq4])
+
+
+
+    def rk4(self, f, x, u, dt):
+        k1 = f(x, u)
+        k2 = f(x + dt/2 * k1, u)
+        k3 = f(x + dt/2 * k2, u)
+        k4 = f(x + dt * k3, u)
+        return x + dt/6 * (k1 + 2*k2 + 2*k3 + k4)
+
+    @partial(jax.jit, static_argnums=(0,))
+    def reset(self, rng):
+        return State(pipeline_state=self.q0, reward=0.0, r_terms=jnp.zeros(4))
+
+    @partial(jax.jit, static_argnums=(0,))
+    def step(self, state: State, action: jax.Array) -> State:
+        u = jnp.clip(action, -1.0, 1.0) * self.max_u
+        q_next = self.rk4(self.dynamics, state.pipeline_state, u, self.dt)
+        r, r_terms = self.get_reward(q_next, u)
+        # r = jnp.asarray(r).reshape(())
+        #r_terms = jnp.asarray(r_terms).reshape((-1,))
+
+        return State(pipeline_state=q_next, reward=r, r_terms=r_terms)
+
+    
+    # def get_reward(self, q, u):
+    #     theta, dtheta, x, dx = q
+
+    #     # Parametri fisici
+    #     m = self.m   # massa pendolo
+    #     l = self.l
+    #     g = self.g
+
+    #     # Scale max per normalizzazione
+    #     dtheta_max = 6.0
+    #     u_max = 10.0
+    #     x_max = 5.0
+
+    #     # Pesi
+    #     w_pot = 4.0
+    #     w_kin = 2.0
+    #     w_x   = 0.5
+    #     w_u   = 0.2
+    #     w_goal = 4
+    #     # # goal 
+    #     # delta_theta = (theta - jnp.pi + jnp.pi) % (2 * jnp.pi) - jnp.pi
+    #     # r_goal = 1.0 - jnp.abs(delta_theta) / jnp.pi   # [0,1]
+    #     # #r_theta = jnp.exp(- (delta_theta / 0.2)**2)  # gaussiana attorno a π
+    #     # # Energie
+    #     # E_pot = m * g * l * (1 - jnp.cos(theta))
+    #     # E_target = m * g * l
+    #     # r_pot = E_pot / E_target              # [0,1]
+
+    #     # E_kin = 0.5 * m * (l**2) * (dtheta**2)
+    #     # E_kin_max = 0.5 * m * (l**2) * (dtheta_max**2)
+    #     # r_kin = 1.0 - jnp.clip(E_kin / E_kin_max, 0.0, 1.0)  # penalità → alto se fermo
+    #     # # Energia cinetica carrello
+    #     # E_kin_cart = 0.5 * self.M * dx**2
+
+    #     # # Energia cinetica pendolo
+    #     # E_kin_pend = 0.5 * self.m * (
+    #     #     (dx + self.l * jnp.cos(theta) * dtheta)**2 +
+    #     #     (self.l * jnp.sin(theta) * dtheta)**2
+    #     # ) + 0.5 * self.I * dtheta**2
+
+    #     # E_kin = E_kin_cart + E_kin_pend
+
+    #     # # Energia potenziale
+    #     # E_pot = self.m * self.g * self.l * jnp.cos(theta)
+    #     E_kin = 1/2 * self.M * dx**2 \
+    #         + 1 / 2 * m * (
+    #             (dx + l * dtheta * jnp.cos(theta))**2 +
+    #             (l * dtheta * jnp.sin(theta))**2
+    #         )
+            
+    #     E_pot = m * g * l * (1-jnp.cos(theta))
+
+    #     # Termini di stabilizzazione (quadratici)
+    #     w_theta = 10
+    #     w_dtheta = 0.5
+    #     cost_stab =0.5* w_theta * (theta**2) + w_dtheta * (dtheta**2)
+
+    #     # Costo tipo do-mpc
+    #     cost = (E_kin - E_pot) + 0.1 * (u**2) #+cost_stab
+
+    #     # Reward = negativo del costo
+    #     reward = -cost#+cost_stab
+
+    #     # Penalità morbide
+    #     r_x = 1.0 / (1.0 + (x/x_max)**2)
+    #     r_u = 1.0 / (1.0 + (u/u_max)**2)
+    #     r_x = jnp.asarray(r_x).reshape(())
+    #     r_u = jnp.asarray(r_u).reshape(())
+    #     E_pot = jnp.asarray(E_pot).reshape(())
+    #     E_kin = jnp.asarray(E_kin).reshape(())
+    #     #r_goal = jnp.asarray(r_goal).reshape(())
+         
+    #     # # Media pesata
+    #     # reward = (
+    #     #     w_pot * r_pot +
+    #     #     w_kin * r_kin +
+    #     #     w_x * r_x +
+    #     #     w_u * r_u
+    #     #    # +w_u*r_goal
+            
+    #     # ) / (w_pot + w_kin + w_x + w_u+1)
+    #     reward = jnp.asarray(reward).reshape(())
+
+    #     r_terms = jnp.array([E_pot, E_kin, r_u,r_x])
+    #     r_terms = jnp.asarray(r_terms).reshape((-1,))
+    #     return reward, r_terms
+    # def get_reward(self, q, u):
+    #     theta, dtheta, x, dx = q
+
+    #     # parametri normalizzazione
+    #     dtheta_max = 4.0  # rad/s
+    #     dx_max = 2.0       # m/s
+    #     u_max = 10.0       # azione max
+
+    #     # pesi
+    #     w_theta = 4.0
+    #     w_dtheta = 0.8
+    #     w_dx = 0.001
+    #     w_u = 0.001
+
+    #     # errore angolare wrapped
+    #     delta_theta = (theta - jnp.pi + jnp.pi) % (2 * jnp.pi) - jnp.pi
+    #     r_goal = 1.0 - jnp.abs(delta_theta) / jnp.pi   # [0,1]
+
+    #     r_dtheta = 1.0 / (1.0 + (dtheta/dtheta_max)**2)
+    #     r_dx     = 1.0 / (1.0 + (dx/dx_max)**2)
+    #     r_u      = 1.0 / (1.0 + (u/u_max)**2)
+
+        
+    #     r_u = jnp.asarray(r_u).reshape(())
+    #     r_goal = jnp.asarray(r_goal).reshape(())
+    #     r_dtheta = jnp.asarray(r_dtheta).reshape(())
+    #     r_dx = jnp.asarray(r_dx).reshape(())
+
+    #     # media pesata
+
+    #     reward = (w_theta * r_goal + w_dtheta * r_dtheta + w_dx * r_dx + w_u * r_u) / (w_theta + w_dtheta + w_dx + w_u)
+    #     reward = jnp.asarray(reward).reshape(())
+
+
+    #     r_terms = jnp.array([r_goal, r_dtheta, r_dx,r_u])
+    #     r_terms = jnp.asarray(r_terms).reshape((-1,))
+    #     return reward, r_terms
+    def get_reward(self, q, u):
+        theta, dtheta, x, dx = q
+
+        # Parametri fisici
+        m, M, l, g = self.m, self.M, self.l, self.g
+
+        # Scale max per normalizzazione
+        dtheta_max = 6.0
+        u_max = 10.0
+        x_max = 5.0
+
+        # === Energie ===
+        # Energia cinetica totale
+        E_kin = 0.5 * M * dx**2 \
+            + 0.5 * m * ((dx + l * dtheta * jnp.cos(theta))**2 +
+                        (l * dtheta * jnp.sin(theta))**2)
+
+        # Energia potenziale corretta
+        E_pot = m * g * l * (1 - jnp.cos(theta))   # 0 in basso, max in alto
+        E_pot_norm = E_pot / (2 * m * g * l)       # normalizza in [0,1]
+
+        # === Stabilizzazione attorno a π ===
+        delta_theta = (theta - jnp.pi + jnp.pi) % (2 * jnp.pi) - jnp.pi
+        r_goal = jnp.exp(- (delta_theta / 0.2)**2)   # gaussiana centrata su π
+
+        # === Penalità morbide ===
+        r_x = 1.0 / (1.0 + (x/x_max)**2)
+        r_u = 1.0 / (1.0 + (u/u_max)**2)
+
+        # === Reward combinata ===
+        reward = (
+            4.0 * E_pot_norm +    # swing-up
+            3.0 * r_goal +        # stabilizzazione in alto
+            0.5 * r_x +           # carrello vicino al centro
+            0.2 * r_u             # controllo dolce
+        ) / (4.0 + 3.0 + 0.5 + 0.2)
+
+        # Ritorna anche termini utili per debug
+        r_terms = jnp.array([E_pot_norm, r_goal, r_x, r_u])
+        return reward, r_terms
+
+
+
+
+    def render(self, x_traj, U=None, rewards=None, r_terms=None, tag=""):
+        
+
+        x_traj = jax.device_get(x_traj)
+        T = x_traj.shape[0]
+        t = jnp.linspace(0, T * self.dt, T)
+
+        theta = x_traj[:, 0]
+        dtheta = x_traj[:, 1]
+        x = x_traj[:, 2]
+        dx = x_traj[:, 3]
+
+        os.makedirs("results/crane/figs", exist_ok=True)
+
+        # === 1. Stati principali ===
+        fig, axs = plt.subplots(4, 1, figsize=(8, 10), sharex=True)
+        fig.suptitle(f"Carroponte - Stati [{tag}]")
+
+        axs[0].plot(t, theta)
+        axs[0].set_ylabel("theta (rad)")
+
+        axs[1].plot(t, dtheta)
+        axs[1].set_ylabel("dtheta/dt (rad/s)")
+
+        axs[2].plot(t, x)
+        axs[2].set_ylabel("x (m)")
+
+        axs[3].plot(t, dx)
+        axs[3].set_ylabel("dx/dt (m/s)")
+        axs[3].set_xlabel("Tempo (s)")
+
+        plt.tight_layout()
+        plt.savefig(f"results/crane/figs/states_{tag}.png")
+        plt.close()
+
+        # === 2. Controllo ===
+        if U is not None:
+            U = jax.device_get(U).squeeze()
+            t_u = jnp.linspace(0, T * self.dt, U.shape[0])
+
+            plt.figure(figsize=(6, 3))
+            plt.plot(t_u, U)
+            plt.title(f"Forza di controllo [{tag}]")
+            plt.xlabel("Tempo (s)")
+            plt.ylabel("F (N)")
+            plt.grid(True)
+            plt.tight_layout()
+            plt.savefig(f"results/crane/figs/control_{tag}.png")
+            plt.close()
+
+        # === 3. Energie e reward ===
+        if r_terms is not None:
+            r_terms = jax.device_get(r_terms)
+            E_pot = r_terms[:, 0]
+            E_kin = r_terms[:, 1]
+
+            plt.figure(figsize=(7, 4))
+            plt.plot(t, E_pot, label="Energia potenziale")
+            plt.plot(t, E_kin, label="Energia cinetica")
+            plt.title(f"Energie [{tag}]")
+            plt.xlabel("Tempo (s)")
+            plt.ylabel("Energia (J)")
+            plt.legend()
+            plt.grid(True)
+            plt.tight_layout()
+            plt.savefig(f"results/crane/figs/energy_{tag}.png")
+            plt.close()
+
+        # === 4. Reward totale ===
+        if rewards is not None:
+            rewards = jax.device_get(rewards)
+            t_r = jnp.linspace(0, rewards.shape[0] * self.dt, rewards.shape[0])
+
+            plt.figure(figsize=(6, 3))
+            plt.plot(t_r, rewards)
+            plt.title(f"Reward totale [{tag}]")
+            plt.xlabel("Tempo (s)")
+            plt.ylabel("Reward")
+            plt.grid(True)
+            plt.tight_layout()
+            plt.savefig(f"results/crane/figs/reward_{tag}.png")
+            plt.close()
+
+        # === 5. Errore angolare rispetto al goal ===
+        delta_theta = jnp.mod(theta + jnp.pi, 2*jnp.pi) - jnp.pi
+        plt.figure(figsize=(6, 3))
+        plt.plot(t, delta_theta, label="Errore angolare (rad)")
+        plt.axhline(0, color='k', linestyle='--', lw=1)
+        plt.title(f"Errore rispetto all'equilibrio instabile  [{tag}]")
+        plt.xlabel("Tempo (s)")
+        plt.ylabel("e_theta (rad)")
+        plt.grid(True)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(f"results/crane/figs/error_theta_{tag}.png")
+        plt.close()
+
+
+    @property
+    def action_size(self):
+        return 1
+
+    @property
+    def observation_size(self):
+        return 4

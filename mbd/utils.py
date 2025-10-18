@@ -133,8 +133,8 @@ def make_log_barrier_collision_cost(n, Ra, epsilon=1e-6):
                 dists = jnp.linalg.norm(diffs, axis=1)
 
                 dist_safe = jnp.clip(dists - 2 * Ra, a_min=epsilon)
-                #barrier = jnp.maximum(-jnp.log(dist_safe), 0.0)
-                barrier = -jnp.log(dist_safe) 
+                barrier = jnp.maximum(-jnp.log(dist_safe), 0.0)
+                #barrier = -jnp.log(dist_safe) 
                 # scaled_dist = jnp.minimum(dists / 0.3, 1.0)
                 # barrier = jnp.log(scaled_dist) / jnp.log(0.2 / 0.5)
                 # penalty = -100*barrier
@@ -249,7 +249,7 @@ def make_orient_final_cost_fn(xg, w_theta=1.0, decay=10.0):
         dists = jnp.linalg.norm(pos_T - goal_pos, axis=-1)         # [n]
         weights = jnp.exp(-decay * dists)                          # [n]
         theta_diff = jnp.arctan2(jnp.sin(theta_T - theta_g),
-                                 jnp.cos(theta_T - theta_g))      # [n]
+                                 jnp.cos(theta_T - theta_g))       # [n]
         penalties = weights * theta_diff**2                        # [n]
         return w_theta * jnp.mean(penalties)                       # media sui robot
 
@@ -300,8 +300,10 @@ def make_lagrangian_fn(state_init, env, Nsample):
         h = residual_fn(pipeline_states)
         h_flat = h.reshape((Y0s.shape[0], -1))
         L_cost_local = control_cost_local +  30*barrier_cost_local  + 20* goal_cost_local+15*formation_cost_local+ 10*obstacle_cost_local #+orient_cost_local+ reverse_penalty_local
-        L_cost_global = control_cost_global + 25*barrier_cost_global + 30* goal_cost_global+15*formation_cost_global+  10*obstacle_cost_global #+ reverse_penalty_global + 30*orient_cost_global # NO OSTACOLI
-        #L_cost_global = 0.5* control_cost_global + 25*barrier_cost_global + 30* goal_cost_global+15*formation_cost_global+  10*obstacle_cost_global+ 30*orient_cost_global+ reverse_penalty_global
+        # no ostacoli
+        L_cost_global =0.5* control_cost_global + 25*barrier_cost_global + 30* goal_cost_global+15*formation_cost_global+  10*obstacle_cost_global #+ reverse_penalty_global + 30*orient_cost_global # NO OSTACOLI
+        # OSTACOLI 
+        #L_cost_global = 0.5* control_cost_global + 25*barrier_cost_global + 30* goal_cost_global+15*formation_cost_global+  10*obstacle_cost_global#+ 30*orient_cost_global+ reverse_penalty_global
         L_constraint = jnp.dot(h_flat, lambda_goal) + 0.5 * mu_k * jnp.sum(h_flat ** 2, axis=1)
         L_tot = L_cost_global+L_constraint
         return L_cost_local,L_constraint,L_tot,control_cost_global,barrier_cost_global,goal_cost_global,h_flat,obstacle_cost_global, reverse_penalty_global, orient_cost_global

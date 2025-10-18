@@ -55,7 +55,6 @@ def cosine_beta_schedule_scaled(T, beta0, betaT, s=0.008):
     alphas = alphas_bar[1:] / alphas_bar[:-1]
     betas = 1 - alphas
 
-    # Riscalamento lineare: beta0_target → beta0, betaT_target → betaT
     beta_min, beta_max = betas.min(), betas.max()
     betas_scaled = (betas - beta_min) / (beta_max - beta_min)  # ∈ [0,1]
     betas_scaled = betas_scaled * (betaT - beta0) + beta0      # ∈ [beta0, betaT]
@@ -251,25 +250,25 @@ def run_diffusion_local(args: Args, U_init: jnp.ndarray,env, rollout_us, reset_e
             U_curr = U_w
             lambda_curr = lambda_goal
             delta_t = 0 
-            U_soft_single = U_full  # shape (L, n, Nu)
+            # U_soft_single = U_full  # shape (L, n, Nu)
         
-            state_soft = env.reset(jax.random.PRNGKey(args.seed ))
-            rew_soft, pipeline_soft = rollout_us(state_soft, U_soft_single)
-            U_soft_batch = jnp.repeat(U_soft_single[None, ...], args.Nsample, axis=0)  # shape (Nsample, L, n, Nu)
-            state_soft = reset_env_jit(jax.random.PRNGKey(args.seed))
-            #rew_soft, pipeline_soft = jax.vmap(rollout_us, in_axes=(None, 0))(state_soft, U_soft_batch)
+            # state_soft = env.reset(jax.random.PRNGKey(args.seed ))
+            # rew_soft, pipeline_soft = rollout_us(state_soft, U_soft_single)
+            # U_soft_batch = jnp.repeat(U_soft_single[None, ...], args.Nsample, axis=0)  # shape (Nsample, L, n, Nu)
+            # state_soft = reset_env_jit(jax.random.PRNGKey(args.seed))
+            # #rew_soft, pipeline_soft = jax.vmap(rollout_us, in_axes=(None, 0))(state_soft, U_soft_batch)
 
             
-            # Usa una nuova lagrangiana con batch size = 1
-            lagrangian_fn_1 = make_lagrangian_fn(state_soft, env, Nsample=1)
+            # # Usa una nuova lagrangiana con batch size = 1
+            # lagrangian_fn_1 = make_lagrangian_fn(state_soft, env, Nsample=1)
 
-            L_soft, _, L_tot_soft, *_ = lagrangian_fn_1(
-                U_soft_single[None, ...], U_soft_single[None, ...], 
-                pipeline_soft[None, ...], pipeline_soft[None, ...], 
-                lambda_curr, args.mu
-            )
+            # L_soft, _, L_tot_soft, *_ = lagrangian_fn_1(
+            #     U_soft_single[None, ...], U_soft_single[None, ...], 
+            #     pipeline_soft[None, ...], pipeline_soft[None, ...], 
+            #     lambda_curr, args.mu
+            # )
 
-            baseline =  L_tot_soft[0] 
+            # baseline =  L_tot_soft[0] 
             # print(f"   baseline = {baseline:.4f}")
             for i in range(N_inner):
 
@@ -291,6 +290,8 @@ def run_diffusion_local(args: Args, U_init: jnp.ndarray,env, rollout_us, reset_e
                 #Y0s_windows = Y0s[:, t_start:t_start + L, :, :]
                 t1 = time.time()
                 state_init = reset_env_jit(rng_w)
+                state_init = reset_env_jit(rng_w)
+
                 rewss, pipeline_states = jax.vmap(rollout_us, in_axes=(None, 0))(state_init, U_fulls)
                 t2 = time.time()
                 delta_t += t2-t1 
@@ -393,6 +394,7 @@ def run_diffusion_local(args: Args, U_init: jnp.ndarray,env, rollout_us, reset_e
                     U = U.at[t_start:t_end].set(U_opt_local)
                 
                 state_init_eval = reset_env_jit(jax.random.PRNGKey(args.seed + 1024))
+                
                 rewss_eval, _ = rollout_us(state_init_eval, U)
 
                 reward_per_robot = rewss_eval.mean(axis=0)

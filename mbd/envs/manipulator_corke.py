@@ -73,7 +73,7 @@ robot = DHRobot([
     RevoluteDH(d=D2, a=L[3], alpha=alpha[3], m=m[3], r=r[3], I=I[3])
 ], name="RRPR")
 
-robot.base = SE3(0, 0, 3.0)
+#robot.base = SE3(0, 0, 3.0)
 robot.gravity = [0, 0, -9.81]
 for link in robot.links:
     link.B = 0.0
@@ -86,6 +86,7 @@ x = np.concatenate((q0, qd0))
 tau = np.zeros(4)
 
 dt = 0.0001
+
 T_sim = 1.0
 steps = int(T_sim / dt)
 
@@ -123,4 +124,6 @@ plt.savefig("results/manipulator/energia_rrpr_corke.png")
 
 print(f"Variazione max energia totale: {max(E_tot) - min(E_tot):.6f} J")
 
-robot.plot(q0, block=True)
+robot.plot(q0, block=True,jointaxes=True,eeframe=True)
+
+

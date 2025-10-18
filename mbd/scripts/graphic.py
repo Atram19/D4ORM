@@ -279,10 +279,48 @@ def update(frame):
     ax.set_xlim(-5, 5)
     ax.set_ylim(-5, 5)
     ax.set_aspect("equal")
+    # for x_c, y_c, w, h in env.static_obstacles:
+    #         rect = plt.Rectangle((x_c - w / 2, y_c - h / 2), w, h,
+    #                             linewidth=1, edgecolor='red', facecolor='red', alpha=0.5)
+    #         ax.add_patch(rect)
+    buffer_min = 0.2
+    buffer_max = 0.5
+
     for x_c, y_c, w, h in env.static_obstacles:
-            rect = plt.Rectangle((x_c - w / 2, y_c - h / 2), w, h,
-                                linewidth=1, edgecolor='red', facecolor='red', alpha=0.5)
-            ax.add_patch(rect)
+        rect_outer = plt.Rectangle(
+            (x_c - (w / 2 + buffer_max), y_c - (h / 2 + buffer_max)),
+            w + 2 * buffer_max,
+            h + 2 * buffer_max,
+            linewidth=0,
+            facecolor='yellow',
+            alpha=0.1,
+            zorder=1
+        )
+        ax.add_patch(rect_outer)
+
+    for x_c, y_c, w, h in env.static_obstacles:
+        rect_inner = plt.Rectangle(
+            (x_c - (w / 2 + buffer_min), y_c - (h / 2 + buffer_min)),
+            w + 2 * buffer_min,
+            h + 2 * buffer_min,
+            linewidth=0,
+            facecolor='yellow',
+            alpha=0.5,
+            zorder=2
+        )
+        ax.add_patch(rect_inner)
+
+    for x_c, y_c, w, h in env.static_obstacles:
+        rect_real = plt.Rectangle(
+            (x_c - w / 2, y_c - h / 2),
+            w, h,
+            linewidth=1,
+            edgecolor='red',
+            facecolor='red',
+            zorder=3
+        )
+        ax.add_patch(rect_real)
+
 
     # Campioni (trasparenti)
     samples = trajectories_all[frame]  # shape (Nsample, T+1, n, 2)

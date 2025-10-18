@@ -21,10 +21,10 @@ class Args:
     # PER D4orm e ECD
     # beta0: float = 0.05         # initial noise
     # betaT: float = 0.1       # final noise  
-    initial_sigma: float = 0.02   # initial gaussian noise # ECD = 1
+    initial_sigma: float = 0.02  # initial gaussian noise # ECD = 1 (0.02PRIMA)
     alpha: float = 0.01         # optimization step size
     mu: float = 10             # penalty term
-    noise_decay: float = 0.03    # decay factor for noise # ECD = 0.3
+    noise_decay: float = 0.03    # decay factor for noise # ECD = 0.3 (prima 0.03)
     not_render: bool = False
     high_resolution: bool = False
     ECD : bool = False

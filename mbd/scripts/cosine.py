@@ -59,7 +59,7 @@ ab_cos_np = np.array(ab_cos)
 timesteps = np.linspace(0, 1, len(ab_lin_np))
 
 plt.figure(figsize=(6, 4))
-plt.plot(timesteps, ab_lin_np, label="linear", color='tab:blue')
+#plt.plot(timesteps, ab_lin_np, label="linear", color='tab:blue')
 plt.plot(timesteps, ab_cos_np, label="cosine", color='darkorange')
 
 plt.xlabel("diffusion step (t/T)")
