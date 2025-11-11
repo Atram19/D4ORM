@@ -15,7 +15,7 @@ import time
 from mbd.butterworth import butterworth_filter_numpy,ar1_noise_numpy
 from mbd.butterworth import get_butterworth_coeffs
 
-    # Single-pass reverse diffusion to initialize U
+# Single-pass reverse diffusion to initialize U
 def ar1_noise(key, shape, rho=0.99999):
     """
     shape: (Nsample, H, n, Nu)
@@ -61,6 +61,90 @@ def cosine_beta_schedule_scaled(T, beta0, betaT, s=0.008):
 
     return betas_scaled
 
+# === PLOT AZIONI DI TUTTI I ROBOT (4 SUBPLOT) ===
+def plot_all_robot_actions(U_opt, dt=0.1, path="results/multicar_iterative"):
+    """
+    Crea una figura con 4 subplot (uno per robot) mostrando ω e v nel tempo.
+    """
+    n = U_opt.shape[1]
+    time = np.arange(U_opt.shape[0]) * dt
+    os.makedirs(path, exist_ok=True)
+
+    fig, axs = plt.subplots(2, 2, figsize=(10, 6))
+    axs = axs.flatten()
+
+    for i in range(n):
+        if i >= 4:  # mostra solo i primi 4 robot
+            break
+        axs[i].plot(time, U_opt[:, i, 0], label="ω [rad/s]", color="tab:orange")
+        axs[i].plot(time, U_opt[:, i, 1], label="v [m/s]", color="tab:blue")
+        axs[i].set_title(f"Robot {i}")
+        axs[i].set_xlabel("Tempo [s]")
+        axs[i].set_ylabel("Azione")
+        axs[i].grid(True)
+        axs[i].legend()
+
+    plt.tight_layout()
+    filename = os.path.join(path, "actions_all_robots.pdf")
+    plt.savefig(filename)
+    plt.close()
+    print(f"Salvato {filename}")
+import matplotlib.pyplot as plt
+
+def plot_obstacle_layout(env):
+    """
+    Visualizza solo la disposizione iniziale dei robot e gli ostacoli statici,
+    con stile pulito e accademico per figure da tesi.
+    """
+    plt.rcParams.update({
+        "font.family": "serif",
+        "font.serif": ["CMU Serif", "DejaVu Serif", "Times"],
+        "font.size": 10,
+        "axes.titlesize": 11,
+        "axes.labelsize": 10,
+        "legend.fontsize": 9,
+        "axes.linewidth": 0.8,
+        "xtick.direction": "in",
+        "ytick.direction": "in",
+        "xtick.major.size": 3,
+        "ytick.major.size": 3,
+    })
+
+    fig, ax = plt.subplots(figsize=(4.2, 4.2))
+    ax.set_aspect('equal')
+    ax.set_xlabel("x [m]")
+    ax.set_ylabel("y [m]")
+    ax.set_title("Ambiente con ostacoli statici", pad=6)
+
+    # === Ostacoli statici ===
+    for x_c, y_c, w, h in env.static_obstacles:
+        rect = plt.Rectangle(
+            (x_c - w / 2, y_c - h / 2), w, h,
+            linewidth=1.0, edgecolor='black',
+            facecolor='#d3d3d3', alpha=0.8, zorder=1
+        )
+        ax.add_patch(rect)
+        
+
+    # === Robot iniziali ===
+    for i, (x, y, _) in enumerate(env.x0):
+        ax.plot(x, y, 'o', color=f"C{i}", markersize=6,
+                markeredgecolor='k', markeredgewidth=0.6, zorder=3)
+        ax.text(x, y - 0.10, f"R{i}", ha='center', va='top', fontsize=8)
+
+    # === Goal finali ===
+    for i, (xg, yg, _) in enumerate(env.xg):
+        ax.plot(xg, yg, 's', color=f"C{i}", markersize=5,
+                markeredgecolor='k', markeredgewidth=0.6, zorder=3)
+
+    # === Griglia tratteggiata ===
+    ax.grid( True, linestyle="-", color="k", linewidth=0.6, alpha=0.7) 
+
+    # === Legenda ===
+    ax.legend(["Ostacoli"], loc='upper right', frameon=False)
+
+    plt.tight_layout()
+    plt.savefig("results/obstacle_layout.pdf", dpi=300)
 
 
 def run_diffusion_once(args: Args,env, rollout_us, reset_env_jit):
@@ -86,9 +170,13 @@ def run_diffusion_once(args: Args,env, rollout_us, reset_env_jit):
         trajectories_samples = []
 
     # Diffusion noise schedule
-    betas = jnp.linspace(args.beta0, args.betaT, args.Ndiffuse)
-    # betas = cosine_beta_schedule(args.Ndiffuse)
-    #betas = cosine_beta_schedule_scaled(args.Ndiffuse, args.beta0, args.betaT)
+    if args.cosine :
+        betas = cosine_beta_schedule(args.Ndiffuse)
+        #betas = cosine_beta_schedule_scaled(args.Ndiffuse, args.beta0, args.betaT)
+
+    else:
+        betas = jnp.linspace(args.beta0, args.betaT, args.Ndiffuse)
+
 
 
     alphas = 1.0 - betas
@@ -106,15 +194,18 @@ def run_diffusion_once(args: Args,env, rollout_us, reset_env_jit):
 
         # Sample noisy controls
         rng, rng_eps = jax.random.split(rng)
-        eps_u = jax.random.normal(rng_eps, (args.Nsample, args.Hsample, n, Nu))
         #eps_u = ar1_noise(rng_eps, (args.Nsample, args.Hsample, n, Nu), rho=0.9)
        
         
+        if args.filter:
+            eps_u = jax.random.normal(rng_eps, (args.Nsample, args.Hsample, n, Nu))
+            eps_u_np = np.array(eps_u)
+            b, a = get_butterworth_coeffs(order=4, fc=2.0, fs=1/env.dt)  # fc personalizzata
+            eps_u_filt_np = butterworth_filter_numpy(eps_u_np, b, a)
+            eps_u = jnp.array(eps_u_filt_np)  # torna in JAX
+        else :
+            eps_u = jax.random.normal(rng_eps, (args.Nsample, args.Hsample, n, Nu))
 
-        # eps_u_np = np.array(eps_u)
-        # b, a = get_butterworth_coeffs(order=4, fc=2.0, fs=1/env.dt)  # fc personalizzata
-        # eps_u_filt_np = butterworth_filter_numpy(eps_u_np, b, a)
-        # eps_u = jnp.array(eps_u_filt_np)  # torna in JAX
 
 
         Y0s = eps_u * sigmas[i] + Ybar_i
@@ -238,8 +329,10 @@ def run_diffusion_local(args: Args, U_init: jnp.ndarray,env, rollout_us, reset_e
     alphas_bar_local = jnp.cumprod(alphas)
     sigmas_local = jnp.sqrt(1 - alphas_bar_local)
 
-
-    lambda_goal = jnp.zeros((n * 2))
+    if args.penalize_backward:
+        lambda_goal = jnp.zeros((n * 3))
+    else :
+        lambda_goal = jnp.zeros((n * 2))
 
     
 
@@ -303,6 +396,8 @@ def run_diffusion_local(args: Args, U_init: jnp.ndarray,env, rollout_us, reset_e
                 # Estimate gradient using score function estimator
                 grad = jnp.einsum("s,slij->lij", L_vals - L_vals.mean(), noise)
                 grad = grad / (Nsample * sigma_k ** 2 + 1e-8) # direzione del gradiente
+                #print(f"→ Gradiente medio: {jnp.linalg.norm(grad).item():.4f}")
+
 
                 
                 rng_key, rng_noise = jax.random.split(rng_w)
@@ -326,7 +421,7 @@ def run_diffusion_local(args: Args, U_init: jnp.ndarray,env, rollout_us, reset_e
 
     if args.ECD:
         state_init_for_goal = reset_env_jit(jax.random.PRNGKey(args.seed + 777))
-        residual_fn = make_residual_fn(state_init_for_goal, env, args.Nsample)
+        residual_fn = make_residual_fn(env.penalize_backward,state_init_for_goal, env, args.Nsample)
         lagrangian = make_lagrangian_fn(state_init_for_goal, env, args.Nsample)
         print("ECD finale")
 
@@ -576,30 +671,51 @@ def main():
        
         fig, ax = plt.subplots(1, 1, figsize=(5, 5))
         ax.set_aspect('equal', adjustable='datalim')
-        # Traiettoria iniziale in grigio tratteggiato
-        cmap = plt.get_cmap('tab20', x_init.shape[0])
-        print("Shape x_init:", x_init.shape)
-        for i in range(x_init.shape[0]):
-            ax.plot(x_init[i, :, 0], x_init[i, :, 1], '--', color=cmap(i),label = f"Robot {i} global")
+        # # Traiettoria iniziale in grigio tratteggiato
+        # cmap = plt.get_cmap('tab20', x_init.shape[0])
+        # print("Shape x_init:", x_init.shape)
+        # for i in range(x_init.shape[0]):
+        #     ax.plot(x_init[i, :, 0], x_init[i, :, 1], '--', color=cmap(i),label = f"Robot {i} global")
 
         env.render(ax, xs, goals=env.xg,actions = U_opt)
         
-        ecd_tag = "ecd" if args.ECD else "d4orm"
-        formation_tag = "form" if args.formation_shift else ""
-        plt.title(f"Optimized final trajector {ecd_tag}_{formation_tag}")
-        plt.tight_layout()
-        plt.savefig(os.path.join(path, f"local_diffusion_{ecd_tag}_{formation_tag}.pdf"))
-        print(f"Figura salvata in {path}/local_diffusion.pdf")
+        ecd_tag = "LIDEC" if args.ECD else "LID"
+        formation_tag = "_form" if args.formation_shift else ""
+        # plt.title(f"Optimized final trajector {ecd_tag}_{formation_tag}")
+        # plt.tight_layout()
+        # plt.savefig(os.path.join(path, f"local_diffusion_{ecd_tag}_{formation_tag}.pdf"))
+        # print(f"Figura salvata in {path}/local_diffusion.pdf")
         
 
         # === Seconda figura: solo env.render ===
         fig2, ax2 = plt.subplots(1, 1, figsize=(5, 5))
         ax2.set_aspect('equal', adjustable='datalim')
         env.render(ax2, xs, goals=env.xg,actions=U_opt)
-        plt.title(f"Optimized final render only {ecd_tag}_{formation_tag}")
+        plt.title(f"local reverse diffusion-{ecd_tag}{formation_tag}")
         plt.tight_layout()
-        plt.savefig(os.path.join(path, f"traiettoria_finale{ecd_tag}_{formation_tag}.pdf"))
-        print(f"Figura salvata in {path}/traiettoria_finale{ecd_tag}_{formation_tag}.pdf")
+        plt.savefig(os.path.join(path, f"local_reverse_diffusion{ecd_tag}.pdf"))
+        print(f"Figura salvata in {path}/local_diffusion_{ecd_tag}.pdf")
+
+        # ================== FIGURA A: SOLO REVERSE DIFFUSION GLOBALE ================== #
+        fig_g, ax_g = plt.subplots(1, 1, figsize=(5, 5))
+        ax_g.set_aspect('equal', adjustable='datalim')
+         # qui usi la tua env.render con X = x_init e, se vuoi, le azioni globali U_init
+        env.render(ax_g, x_init, goals=env.xg, actions=U_init, style="flow")
+        ax_g.set_title(f"Reverse diffusion globale")
+        plt.tight_layout()
+        plt.savefig(os.path.join(path, f"global_diffusion.pdf"))
+        print(f"Figura globale salvata in {path}/global_diffusion.pdf")
+
+        # # ================== FIGURA B: SOLO TRAIETTORIE OTTIMIZZATE (LID / LIDEC) ================== #
+        # fig_l, ax_l = plt.subplots(1, 1, figsize=(5, 5))
+        # ax_l.set_aspect('equal', adjustable='datalim')
+
+        # env.render(ax_l, xs, goals=env.xg, actions=U_opt, style="flow")
+        # ax_l.set_title(f"Traiettorie ottimizzate – {ecd_tag}")
+        # plt.tight_layout()
+        # plt.savefig(os.path.join(path, f"local_diffusion_{ecd_tag}.pdf"))
+        # print(f"Figura locale salvata in {path}/local_diffusion_{ecd_tag}.pdf")
+
 
 
         output_dir_local = os.path.join(path, "reward_local")
@@ -611,6 +727,9 @@ def main():
         # Save trajectory data and optimized control
         
         np.savez(f"results/multicar_iterative/optimized_data_{ecd_tag}_{formation_tag}.npz", U_opt=np.array(U_opt), traj=np.array(traj), goals=np.array(env.xg), rewards=np.array(rewards_per_iter))
+        
+       
+        plot_all_robot_actions(U_opt)
 
         #Create video
 
@@ -761,6 +880,7 @@ def main():
 
         ax.legend(points, labels, loc='upper right')
 
+        plot_obstacle_layout(env)
 
         video_path = os.path.join(path, f"local_diffusion_{ecd_tag}_{formation_tag}.mp4")
         ani.save(video_path, fps=10, dpi=150)

@@ -120,7 +120,7 @@ def make_goal_tracking_cost(xg, x0):
     return jax.vmap(sample_cost)
  
 # === COSTO DI COLLISIONE ===
-def make_log_barrier_collision_cost(n, Ra, epsilon=1e-6):
+def make_log_barrier_collision_cost(obs,n, Ra, epsilon=1e-6):
     """
     Costo continuo, sempre positivo vicino, zero lontano, senza soglia.
     """
@@ -133,8 +133,13 @@ def make_log_barrier_collision_cost(n, Ra, epsilon=1e-6):
                 dists = jnp.linalg.norm(diffs, axis=1)
 
                 dist_safe = jnp.clip(dists - 2 * Ra, a_min=epsilon)
-                barrier = jnp.maximum(-jnp.log(dist_safe), 0.0)
-                #barrier = -jnp.log(dist_safe) 
+                if obs:
+                    barrier = -jnp.log(dist_safe) # ostacoli no commento
+                   
+                else:
+                    barrier = jnp.maximum(-jnp.log(dist_safe), 0.0)
+
+                
                 # scaled_dist = jnp.minimum(dists / 0.3, 1.0)
                 # barrier = jnp.log(scaled_dist) / jnp.log(0.2 / 0.5)
                 # penalty = -100*barrier
@@ -172,7 +177,7 @@ def make_formation_cost_fn(x0_all):
     return formation_cost
 
 # Computes the residual (final position error) from the goal
-def make_residual_fn(state_init, env, Nsample):
+def make_residual_fn(penalize,state_init, env, Nsample):
     """
     Creates a residual function that measures the final position error
     of each robot with respect to the goal positions.
@@ -186,14 +191,16 @@ def make_residual_fn(state_init, env, Nsample):
         x_Ts = trajs[:, -1, :, :2]
         theta_Ts = trajs[:, -1, :, 2]     # (Nsample, n)
         goal_error = x_Ts - env.xg[:, :2]
+        if penalize:
+            # Errore sull'orientamento: differenza angolare corretta
+            theta_g = env.xg[:, 2]  # (n,)
+            theta_diff = jnp.arctan2(jnp.sin(theta_Ts - theta_g), jnp.cos(theta_Ts - theta_g))  
 
-        # # Errore sull'orientamento: differenza angolare corretta
-        # theta_g = env.xg[:, 2]  # (n,)
-        # theta_diff = jnp.arctan2(jnp.sin(theta_Ts - theta_g), jnp.cos(theta_Ts - theta_g))  
-
-        #  # Concatenazione completa: posizione (2) + orientamento (1)
-        # residual = jnp.concatenate([goal_error, theta_diff[:, :, None]], axis=-1)  # (Nsample, n, 3)
-        return goal_error
+            # Concatenazione completa: posizione (2) + orientamento (1)
+            residual = jnp.concatenate([goal_error, theta_diff[:, :, None]], axis=-1)  # (Nsample, n, 3)
+        else :
+                residual = x_Ts - env.xg[:, :2]
+        return  residual#goal_error
 
     return residual_fn
 
@@ -259,13 +266,13 @@ def make_orient_final_cost_fn(xg, w_theta=1.0, decay=10.0):
 
 # Lagrangian function for equality-constrained optimization
 def make_lagrangian_fn(state_init, env, Nsample):
-    residual_fn = make_residual_fn(state_init, env, Nsample)
-    log_barrier_fn = make_log_barrier_collision_cost(env.n,env.Ra, epsilon=1e-3)
+    residual_fn = make_residual_fn(env.penalize_backward,state_init, env, Nsample)
+    log_barrier_fn = make_log_barrier_collision_cost(env.obstacles_enabled,env.n,env.Ra, epsilon=1e-3)
     goal_cost_fn = make_goal_tracking_cost(env.xg, env.x0)
     formation_cost_fn = make_formation_cost_fn(env.x0) if env.formation_shift else lambda x: 0.0
     obstacle_cost_fn = make_static_obstacle_cost(env.static_obstacles, env.Ra) if env.obstacles_enabled else lambda x: 0.0
     reverse_penalty_fn = make_reverse_penalty_cost() if env.penalize_backward else lambda x: 0.0
-    orient_cost_fn = make_orient_final_cost_fn(env.xg)
+    orient_cost_fn = make_orient_final_cost_fn(env.xg) if env.penalize_backward else lambda x: 0.0
 
 
     @jax.jit
@@ -301,9 +308,9 @@ def make_lagrangian_fn(state_init, env, Nsample):
         h_flat = h.reshape((Y0s.shape[0], -1))
         L_cost_local = control_cost_local +  30*barrier_cost_local  + 20* goal_cost_local+15*formation_cost_local+ 10*obstacle_cost_local #+orient_cost_local+ reverse_penalty_local
         # no ostacoli
-        L_cost_global =0.5* control_cost_global + 25*barrier_cost_global + 30* goal_cost_global+15*formation_cost_global+  10*obstacle_cost_global #+ reverse_penalty_global + 30*orient_cost_global # NO OSTACOLI
+        #L_cost_global = 0.5* control_cost_global + 25*barrier_cost_global + 30* goal_cost_global+15*formation_cost_global+  10*obstacle_cost_global #+ reverse_penalty_global + 30*orient_cost_global # NO OSTACOLI
         # OSTACOLI 
-        #L_cost_global = 0.5* control_cost_global + 25*barrier_cost_global + 30* goal_cost_global+15*formation_cost_global+  10*obstacle_cost_global#+ 30*orient_cost_global+ reverse_penalty_global
+        L_cost_global = 0.5* control_cost_global + 25*barrier_cost_global + 30* goal_cost_global+15*formation_cost_global+  10*obstacle_cost_global+ 30*orient_cost_global+ 10*reverse_penalty_global
         L_constraint = jnp.dot(h_flat, lambda_goal) + 0.5 * mu_k * jnp.sum(h_flat ** 2, axis=1)
         L_tot = L_cost_global+L_constraint
         return L_cost_local,L_constraint,L_tot,control_cost_global,barrier_cost_global,goal_cost_global,h_flat,obstacle_cost_global, reverse_penalty_global, orient_cost_global

@@ -19,21 +19,22 @@ class Args:
     beta0: float = 1e-4         # initial noise
     betaT: float = 1e-2         # final noise  
     # PER D4orm e ECD
-    # beta0: float = 0.05         # initial noise
-    # betaT: float = 0.1       # final noise  
-    initial_sigma: float = 0.02  # initial gaussian noise # ECD = 1 (0.02PRIMA)
+    # beta0: float = 0.05       # initial noise
+    # betaT: float = 0.1        # final noise  
+    initial_sigma: float = 0.02 # initial gaussian noise # ECD = 1 (0.02PRIMA)
     alpha: float = 0.01         # optimization step size
-    mu: float = 10             # penalty term
-    noise_decay: float = 0.03    # decay factor for noise # ECD = 0.3 (prima 0.03)
+    mu: float = 10              # penalty term
+    noise_decay: float = 0.03   # decay factor for noise # ECD = 0.3 (prima 0.03)
     not_render: bool = False
     high_resolution: bool = False
     ECD : bool = False
     formation_shift: bool = False 
     T: int = 30
     save_video: bool = False 
+    cosine: bool = False 
     obstacles_enabled: bool = False  # Attiva penalità da ostacoli se True
     penalize_backward: bool = False
-
+    filter: bool = False
 
 
 def car_dynamics(x, u):
@@ -153,20 +154,23 @@ class MultiCar2d:
         self. ECD = ECD
         self.penalize_backward = penalize_backward
         if obstacles_enabled:
-            # self.static_obstacles = jnp.array([
-            #     [0.0, 1.5, 0.6, 0.1],
-            #     [0.0, -1.5, 0.6, 0.1],
-            #     [-1.5, 0.0, 0.1, 0.6],
-            #     [1.5, 0.0, 0.1, 0.6],
-            # ])
             
-            # 
             self.static_obstacles = jnp.array([
-                [0.0,  0.8, 1.5, 0.07],   # parete orizzontale in alto
-                [0.0, -0.8, 1.8, 0.07],   # parete orizzontale in basso
+                [0.0,  0.8, 1.5, 0.07],   # parete orizzontale in alto 1.5 
+                [0.0, -0.8, 1.8, 0.07],   # parete orizzontale in basso prima 1.8 dove 1.5 attenzione
                 [-0.8, 0.0, 0.07, 1.8],   # parete verticale a sinistra
                 [ 0.8, 0.0, 0.07, 1.8],   # parete verticale a destra
-            ])/1.3
+            ])/1.3 #/2.5
+            # TRIS
+            # self.static_obstacles = jnp.array([
+            #     # --- linee verticali ---
+            #     [-0.8, 0.0, 0.07, 3.0],   # sinistra lunga
+            #     [ 0.8, 0.0, 0.07, 3.0],   # destra lunga
+
+            #     # --- linee orizzontali ---
+            #     [0.0, -0.8, 3.0, 0.07],   # inferiore lunga
+            #     [0.0,  0.8, 3.0, 0.07],   # superiore lunga
+            # ]) / 1.3 #2.5   # opzionale: scala ambiente
 
         else:
             self.static_obstacles = jnp.zeros((0, 4))
@@ -246,10 +250,10 @@ class MultiCar2d:
             theta_target = self.xg[k][2]
 
             # Penalità sull'orientazione finale: attivata sempre, ma pesata sulla distanza
-            dist_to_goal = jnp.linalg.norm(p - self.xg[k][:2])
-            orient_error = 1.0 - jnp.cos(theta - theta_target)  # 0 se orientato, ~2 se opposto
-            w_orient = jnp.exp(-10.0 * dist_to_goal)  # peso decrescente con la distanza
-            r_orient_final = - w_orient * orient_error  # penalità negativa
+            # dist_to_goal = jnp.linalg.norm(p - self.xg[k][:2])
+            # orient_error = 1.0 - jnp.cos(theta - theta_target)  # 0 se orientato, ~2 se opposto
+            # w_orient = jnp.exp(-10.0 * dist_to_goal)  # peso decrescente con la distanza
+            # r_orient_final = - w_orient * orient_error  # penalità negativa
 
    
             dists = jnp.linalg.norm(p - q_all[:, :2], axis=1)
@@ -284,26 +288,31 @@ class MultiCar2d:
                 obstacles = jnp.array(self.static_obstacles)
                 r_obs_vals = jax.vmap(lambda obs: single_obs_penalty(p, obs))(obstacles)
                 r_obstacles = jnp.mean(r_obs_vals)  
+               
             else:
                 r_obstacles = 0.0
+                
 
             if self.penalize_backward:
                 v = u_k[1]
                 r_backward = jnp.where(v < -0.05, - jnp.abs(v), 0.0)
+                dist_to_goal = jnp.linalg.norm(p - self.xg[k][:2])
+                orient_error = 1.0 - jnp.cos(theta - theta_target)  # 0 se orientato, ~2 se opposto
+                w_orient = jnp.exp(-10.0 * dist_to_goal)  # peso decrescente con la distanza
+                r_orient_final = - w_orient * orient_error  # penalità negativa
             else:
                 r_backward = 0.0
+                r_orient_final = 0.0
 
             r_form = -rews_formation(q_all, self.x0) if self.formation_shift else 0.0
             r_control =  - jnp.sum(u_k ** 2)  # penalizzazione sul controllo
-            r_total_check = r_goal + self.wt * r_safe + r_form + 0.01 * r_control + r_obstacles #+r_backward + self.wt*r_orient_final  
+            r_total_check = r_goal + self.wt * r_safe + r_form + 0.01 * r_control + r_obstacles +r_backward + self.wt*r_orient_final  
             #jax.debug.print("r_total check: {}, from terms: {}", r_total_check, jnp.array([r_goal, r_safe, r_form, r_control, r_obstacles]))
             r_terms = jnp.array([r_goal, r_safe, r_form, r_control, r_obstacles,r_backward, r_total_check])
             return r_total_check, r_terms
         
         r_total_all, r_terms_all =   jax.vmap(single_reward, in_axes=(0, 0, 0))(jnp.arange(self.n), q_all, u_all)
         return r_total_all, r_terms_all
-
-
 
 
     # size of the action space
@@ -321,62 +330,209 @@ class MultiCar2d:
     def num_robots(self):
         return self.n
     
-    
 
-    #  Function for visualizing the environment
-    def render(self, ax, X: jnp.ndarray, goals: jnp.ndarray = None,actions: jnp.ndarray = None):
+    # #  Function for visualizing the environment
+    # def render(self, ax, X: jnp.ndarray, goals: jnp.ndarray = None,actions: jnp.ndarray = None):
         
-        n = X.shape[0]
-        cmap = plt.get_cmap('tab20', n)
+    #     n = X.shape[0]
+    #     cmap = plt.get_cmap('tab20', n)
  
-        for i in range(n):
-            traj = X[i]             
-            x, y, theta = traj[-1]  
-            start_x, start_y = traj[0, 0], traj[0, 1] 
+    #     for i in range(n):
+    #         traj = X[i]             
+    #         x, y, theta = traj[-1]  
+    #         start_x, start_y = traj[0, 0], traj[0, 1] 
 
-            # color = f"C{i % n}"
-            color = cmap(i)
+    #         # color = f"C{i % n}"
+    #         color = cmap(i)
 
-            # Draw the trajectory
-            ax.plot(traj[:, 0], traj[:, 1], '-', color=color, label=f"Robot {i}")
-            #ax.plot(start_x, start_y, 's', color=color, markersize=4, label=f"Start {i}")
-            #ax.plot(x,y,'*',color=color, markersize=7, label=f"End {i}")
+    #         # Draw the trajectory
+    #         ax.plot(traj[:, 0], traj[:, 1], '-', color=color, label=f"Robot {i}")
+    #         #ax.plot(start_x, start_y, 's', color=color, markersize=4, label=f"Start {i}")
+    #         #ax.plot(x,y,'*',color=color, markersize=7, label=f"End {i}")
 
-            # Draw the goal position
-            if goals is not None:
-                 gx, gy = goals[i, 0], goals[i, 1]
-                 ax.plot(gx, gy, 'x', color=color, markersize=6)
+    #         # Draw the goal position
+    #         if goals is not None:
+    #              gx, gy = goals[i, 0], goals[i, 1]
+    #              ax.plot(gx, gy, 'x', color=color, markersize=6)
             
 
-            # Draw the robot orientation
-            dx = 0.3 * jnp.cos(theta)
-            dy = 0.3 * jnp.sin(theta)
-            if actions is not None:
-                v = actions[i, -1, 1]  # ultima velocità lineare del robot i
-                color_arrow = 'green' if v >= -0.05 else 'red'  # o qualsiasi soglia
-            else:
-                color_arrow = color
+    #         # Draw the robot orientation
+    #         dx = 0.3 * jnp.cos(theta)
+    #         dy = 0.3 * jnp.sin(theta)
+    #         if actions is not None:
+    #             v = actions[i, -1, 1]  # ultima velocità lineare del robot i
+    #             color_arrow = 'green' if v >= -0.05 else 'red'  # o qualsiasi soglia
+    #         else:
+    #             color_arrow = color
 
-            ax.arrow(x, y, dx, dy, head_width=0.1, head_length=0.15, fc=color_arrow, ec=color_arrow)
+    #         ax.arrow(x, y, dx, dy, head_width=0.1, head_length=0.15, fc=color_arrow, ec=color_arrow)
 
-            ax.arrow(x, y, dx, dy, head_width=0.1, head_length=0.15, fc=color, ec=color)
+    #         ax.arrow(x, y, dx, dy, head_width=0.1, head_length=0.15, fc=color, ec=color)
         
-        ax.set_aspect('equal', adjustable='box')
-        ax.grid(True)
+    #     ax.set_aspect('equal', adjustable='box')
+    #     ax.grid(True)
         
-        # Display the two circles
-        if self.formation_shift:
-                c0 = self.x0[:, :2].mean(axis=0)
-                circle0 = plt.Circle((c0[0], c0[1]), self.radius, color='gray', linestyle='--', fill=False)
-                ax.add_patch(circle0)
-                cg = self.xg[:, :2].mean(axis=0)
-                circleg = plt.Circle((cg[0], cg[1]), self.radius, color='black', linestyle='--', fill=False)
-                ax.add_patch(circleg)
+    #     # Display the two circles
+    #     if self.formation_shift:
+    #             c0 = self.x0[:, :2].mean(axis=0)
+    #             circle0 = plt.Circle((c0[0], c0[1]), self.radius, color='gray', linestyle='--', fill=False)
+    #             ax.add_patch(circle0)
+    #             cg = self.xg[:, :2].mean(axis=0)
+    #             circleg = plt.Circle((cg[0], cg[1]), self.radius, color='black', linestyle='--', fill=False)
+    #             ax.add_patch(circleg)
+    #     for x_c, y_c, w, h in self.static_obstacles:
+    #         rect = plt.Rectangle((x_c - w / 2, y_c - h / 2), w, h,
+    #                             linewidth=1, edgecolor='red', facecolor='red', alpha=0.5)
+    #         ax.add_patch(rect)
+
+    #     ax.legend(loc='center left', bbox_to_anchor=(1, 0.5), fontsize=8)
+
+
+    def render(self, ax, X: jnp.ndarray, goals: jnp.ndarray = None, actions: jnp.ndarray = None, style: str = "flow"):
+        """
+        Visualizza le traiettorie ottimizzate dei robot con linea continua e frecce direzionali.
+        Stile accademico sobrio, adatto per tesi e pubblicazioni.
+        """
+        n = X.shape[0]
+
+        # === Impostazioni grafiche ===
+        if style == "flow":
+            plt.rcParams.update({
+                "font.family": "serif",
+                "font.serif": ["CMU Serif", "DejaVu Serif", "Times"],
+                "font.size": 10,
+                "axes.titlesize": 11,
+                "axes.labelsize": 10,
+                "legend.fontsize": 9,
+                "axes.linewidth": 0.8,
+                "xtick.direction": "in",
+                "ytick.direction": "in",
+                "xtick.major.size": 3,
+                "ytick.major.size": 3,
+            })
+
+
+        # === Palette accademica e sobria ===
+        palette = [
+            "#1f77b4",  # blu
+            "#ff7f0e",  # arancio
+            "#2ca02c",  # verde
+            "#d62728",  # rosso
+            "#9467bd",  # viola
+            "#8c564b",  # marrone
+            "#e377c2",  # rosa chiaro
+            "#7f7f7f",  # grigio
+        ]
+      
+
+        colors = palette[:n]
+
+        # === Disegna traiettorie con linea continua e frecce direzionali ===
+        for i in range(n):
+            traj = jnp.array(X[i])
+            color = colors[i % len(colors)]
+
+            # Linea continua
+            ax.plot(
+                traj[:, 0], traj[:, 1],
+                color=color, linewidth=1.3, alpha=0.8, zorder=2
+            )
+
+            # Freccette direzionali
+            step = max(2, len(traj) // 30)
+            for t in range(0, len(traj) - 1, step):
+                x, y, theta = traj[t, 0], traj[t, 1], traj[t, 2]
+                dx = 0.1 * jnp.cos(theta)
+                dy = 0.1 * jnp.sin(theta)
+                ax.arrow(
+                    x, y, dx, dy,
+                    head_width=0.05, head_length=0.06,
+                    fc=color, ec=color, lw=0.8,
+                    alpha=0.7, overhang=0.5,
+                    length_includes_head=True, zorder=3
+                )
+
+            # Punto iniziale (cerchio bianco con bordo colorato)
+            ax.plot(
+                traj[0, 0], traj[0, 1],
+                marker='o', color=color, markersize=4.5,
+                markerfacecolor='white', markeredgewidth=0.9, zorder=4
+            )
+            ax.grid(
+                True, linestyle="-", color="k", linewidth=0.6, alpha=0.7
+            )  
+
+        # === Goal (stelle nere) ===
+        if goals is not None:
+            for i in range(n):
+                gx, gy = goals[i, 0], goals[i, 1]
+                ax.plot(
+                    gx, gy, marker='s', color=palette[i], markersize=5.5,
+                    markeredgewidth=0.8, zorder=5
+                )
+        
+        # === Ostacoli statici ===
+        # for x_c, y_c, w, h in self.static_obstacles:
+        #     rect = plt.Rectangle(
+        #         (x_c - w / 2, y_c - h / 2), w, h,
+        #         linewidth=0.8, edgecolor='0.3',
+        #         facecolor='0.85', alpha=0.6, zorder=1
+        #     )
+        #     ax.add_patch(rect)
+        # === Ostacoli statici ===
         for x_c, y_c, w, h in self.static_obstacles:
-            rect = plt.Rectangle((x_c - w / 2, y_c - h / 2), w, h,
-                                linewidth=1, edgecolor='red', facecolor='red', alpha=0.5)
+            rect = plt.Rectangle(
+                (x_c - w / 2, y_c - h / 2), w, h,
+                linewidth=1.0, edgecolor='black',
+                facecolor='#d3d3d3', zorder=1
+            )
             ax.add_patch(rect)
+        # === Fasce di penalità (zona debole + zona forte) ===
+        buffer_min = 0.2
+        buffer_max = 0.5
+        for x_c, y_c, w, h in self.static_obstacles:
+            # Zona esterna (penalità debole)
+            rect_outer = plt.Rectangle(
+                (x_c - (w / 2 + buffer_max), y_c - (h / 2 + buffer_max)),
+                w + 2 * buffer_max, h + 2 * buffer_max,
+                linewidth=0.8, edgecolor='none',
+                facecolor='#a6bddb', alpha=0.25, zorder=1
+            )
+            ax.add_patch(rect_outer)
 
-        ax.legend(loc='center left', bbox_to_anchor=(1, 0.5), fontsize=8)
+            # Zona interna = penalità forte
+            rect_inner = plt.Rectangle(
+                (x_c - (w / 2 + buffer_min), y_c - (h / 2 + buffer_min)),
+                w + 2 * buffer_min, h + 2 * buffer_min,
+                linewidth=0.8, edgecolor='none',
+                facecolor='#3690c0', alpha=0.35, zorder=2
+            )
+            ax.add_patch(rect_inner)
 
+
+        # === Cerchi di formazione (se presenti) ===
+        if self.formation_shift:
+            c0 = self.x0[:, :2].mean(axis=0)
+            cg = self.xg[:, :2].mean(axis=0)
+            ax.add_patch(plt.Circle(c0, self.radius, color='gray', linestyle='--', fill=False, lw=0.6, alpha=0.5))
+            ax.add_patch(plt.Circle(cg, self.radius, color='black', linestyle='--', fill=False, lw=0.6, alpha=0.5))
+
+        # === Impostazioni finali ===
+        ax.set_aspect('equal', adjustable='box')
+        ax.set_xlabel("x [m]")
+        ax.set_ylabel("y [m]")
+        ax.set_title("Traiettorie ottimizzate – direzioni di moto", pad=8)
+
+        # === Legenda compatta ===
+        ax.legend(
+            [plt.Line2D([], [], color=colors[i], lw=1.3) for i in range(n)],
+            [f"R{i}" for i in range(n)],
+            loc='upper right', frameon=False,
+            handlelength=1.5, handletextpad=0.6,
+            borderpad=0.2, labelspacing=0.3,
+            title="Robot", title_fontsize=9
+        )
+
+        # Margini puliti
+        ax.margins(0.1)
 
